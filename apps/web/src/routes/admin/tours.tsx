@@ -5,6 +5,7 @@ import { useLocation } from "react-router";
 import { LogoMark } from "../../components/brand.tsx";
 import { Tour, type TourStep } from "../../components/tour.tsx";
 import type { Business, User } from "../../lib/api.ts";
+import { businessPath } from "../../lib/businesses.ts";
 import { useSeenTours, useTourMutations } from "../../lib/tours.ts";
 
 /** The section tours, by the page's path inside the business. */
@@ -13,12 +14,13 @@ const SECTIONS: Record<string, TourName> = {
   customers: "customers",
   services: "services",
   professionals: "professionals",
+  locations: "locations",
   hours: "hours",
   settings: "settings",
 };
 
 /** The sections the welcome tour walks through, for people who manage the business. */
-const MANAGED = ["customers", "services", "professionals", "hours", "settings"] as const;
+const MANAGED = ["customers", "inventory", "reports", "sales", "admin", "settings"] as const;
 
 function stepsOf(
   t: TFunction,
@@ -75,6 +77,7 @@ function stepsOf(
       }));
     case "services":
     case "professionals":
+    case "locations":
       return [
         {
           target: `${tour}-new`,
@@ -106,7 +109,7 @@ export function BusinessTours({ business, user }: { business: Business; user: Us
   const { finish } = useTourMutations();
   if (!seen.data) return null;
 
-  const base = `/admin/businesses/${business.id}`;
+  const base = businessPath(business);
   const section = SECTIONS[pathname.replace(/\/$/, "").slice(base.length).replace(/^\//, "")];
   const tour: TourName | undefined = !seen.data.includes("welcome")
     ? "welcome"

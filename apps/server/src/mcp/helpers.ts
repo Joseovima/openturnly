@@ -59,6 +59,7 @@ const EXPLANATIONS: Record<string, string> = {
   appointment_not_found:
     "No appointment matches that booking code (and phone or email). Ask the customer to check them.",
   appointment_cancelled: "That appointment is already cancelled.",
+  appointment_no_show: "That appointment was marked as a no-show: the customer didn't come.",
   too_late_to_change:
     "It is too late for the customer to change or cancel this appointment themselves; they should contact the business.",
   changes_not_allowed:
@@ -75,6 +76,10 @@ const EXPLANATIONS: Record<string, string> = {
   validation_failed: "Some values are missing or invalid (see the fields).",
   nothing_to_change: "Nothing to change: send at least one of the fields.",
   business_not_found: "This business no longer exists.",
+  location_required:
+    "This business has several locations: ask the customer which one and pass its location_id (see get_business_info).",
+  location_not_found: "That location doesn't exist or isn't taking bookings. List them again.",
+  not_at_location: "That professional doesn't work at that location.",
   forbidden: "This access key isn't allowed to do that.",
 };
 

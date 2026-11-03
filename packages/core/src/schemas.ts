@@ -279,10 +279,17 @@ export const bookingQuestionSchema = z
   });
 export type BookingQuestion = z.infer<typeof bookingQuestionSchema>;
 
+/** Details about the customer the booking form can also ask for; left out unless chosen. */
+export const EXTRA_CUSTOMER_FIELDS = ["birthDate", "document", "gender"] as const;
+export type ExtraCustomerField = (typeof EXTRA_CUSTOMER_FIELDS)[number];
+
 export const bookingFormSchema = z
   .object({
     phone: z.enum(FIELD_RULES),
     email: z.enum(FIELD_RULES),
+    birthDate: z.enum(FIELD_RULES).default("hidden"),
+    document: z.enum(FIELD_RULES).default("hidden"),
+    gender: z.enum(FIELD_RULES).default("hidden"),
     questions: z.array(bookingQuestionSchema).max(MAX_QUESTIONS),
   })
   .refine((form) => form.phone === "required" || form.email === "required", {
@@ -295,6 +302,9 @@ export type BookingForm = z.infer<typeof bookingFormSchema>;
 export const DEFAULT_BOOKING_FORM: BookingForm = {
   phone: "required",
   email: "optional",
+  birthDate: "hidden",
+  document: "hidden",
+  gender: "hidden",
   questions: [],
 };
 
@@ -340,11 +350,15 @@ export type BusinessUpdateInput = z.infer<typeof businessUpdateSchema>;
 export const serviceSchema = z.object({
   name: z.string().trim().min(1).max(120),
   description: optionalText(1000),
+  /** Groups the booking page's menu ("Cortes", "Barba"…). */
+  category: optionalText(60),
   durationMin: z.number().int().min(5).max(600),
   /** Minor currency units (cents). Null means "ask at the business". */
   /** Always shown on the booking page; 0 for free services. */
   priceAmount: z.number().int().min(0).max(1e12),
   active: z.boolean().default(true),
+  /** Where it is offered. Left out when creating: every location. */
+  locationIds: z.array(z.string().min(1)).max(200).optional(),
 });
 export type ServiceInput = z.infer<typeof serviceSchema>;
 
@@ -352,8 +366,24 @@ export const professionalSchema = z.object({
   name: z.string().trim().min(1).max(120),
   active: z.boolean().default(true),
   serviceIds: z.array(z.string().min(1)).max(500),
+  /** Where they work. Left out when creating: every location. */
+  locationIds: z.array(z.string().min(1)).max(200).optional(),
+  /** What they earn of each service and each product they sell, in percent. */
+  serviceCommission: z.number().min(0).max(100).default(0),
+  productCommission: z.number().min(0).max(100).default(0),
 });
 export type ProfessionalInput = z.infer<typeof professionalSchema>;
+
+/** A location of the business, with the services it offers and the people who work there. */
+export const locationSchema = z.object({
+  name: z.string().trim().min(1).max(120),
+  address: optionalText(300),
+  phone: optionalText(40),
+  active: z.boolean().default(true),
+  serviceIds: z.array(z.string().min(1)).max(500),
+  resourceIds: z.array(z.string().min(1)).max(500),
+});
+export type LocationInput = z.infer<typeof locationSchema>;
 
 // --- Opening hours ---------------------------------------------------------
 
@@ -367,10 +397,12 @@ export const weeklyRangeSchema = z.object({
 });
 
 /**
- * Replaces the weekly hours of the business (`resourceId: null`) or of one professional.
- * An empty list for a professional means "use the business hours".
+ * Replaces the weekly hours of a location (`resourceId: null`) or of one professional at
+ * that location. An empty list for a professional means "use the location's hours".
+ * Without `locationId`, the business's first location.
  */
 export const weeklyHoursSchema = z.object({
+  locationId: z.string().min(1).optional(),
   resourceId: z.string().min(1).nullable(),
   hours: z
     .array(weeklyRangeSchema)
@@ -389,12 +421,14 @@ export const MAX_CLOSURE_DAYS = 366;
 
 /**
  * Days without bookings, from `date` to `endDate` (inclusive; one day when left out), for
- * the whole business (`resourceId: null`) or one professional.
+ * one professional wherever they work, or else one location (`locationId`) or every
+ * location (both null).
  */
 export const closureSchema = z
   .object({
     date: calendarDate,
     endDate: calendarDate.optional(),
+    locationId: z.string().min(1).nullable().default(null),
     resourceId: z.string().min(1).nullable(),
     note: optionalText(120),
   })
@@ -455,11 +489,37 @@ function requireContact(
   }
 }
 
+export const GENDERS = ["female", "male", "other"] as const;
+export type Gender = (typeof GENDERS)[number];
+
+/** A birth date between 1900 and today; empty is no date. */
+const optionalBirthDate = z
+  .union([calendarDate, z.literal("")])
+  .refine(
+    (value) => !value || (value >= "1900-01-01" && value <= new Date().toISOString().slice(0, 10)),
+    "invalid_date",
+  )
+  .transform((value) => value || null)
+  .nullable()
+  .optional();
+
+const optionalGender = z
+  .union([z.enum(GENDERS), z.literal("")])
+  .transform((value) => value || null)
+  .nullable()
+  .optional();
+
+/** An ID number as the customer writes it ("1.020.304.050", "AB123456"). */
+const optionalDocument = optionalText(40);
+
 const customerFields = z.object({
   firstName: personName,
   lastName: personName,
   phone: optionalPhone,
   email: optionalEmail,
+  birthDate: optionalBirthDate,
+  document: optionalDocument,
+  gender: optionalGender,
   /** Private notes for the business, never shown to the customer. */
   notes: optionalText(1000),
 });
@@ -470,12 +530,56 @@ export type CustomerAdminInput = z.input<typeof customerAdminSchema>;
 /** Edits send only what changed; the server checks a contact is left. */
 export const customerPatchSchema = customerFields.partial();
 
+/** Most customers in one import. */
+export const MAX_IMPORT_ROWS = 5000;
+
+/**
+ * Customers from a spreadsheet, as the file has them; each row is checked on the server
+ * with `importedCustomerSchema`. `apply: false` only previews what would happen.
+ */
+export const customerImportSchema = z.object({
+  rows: z
+    .array(
+      z.object({
+        firstName: z.string().max(200).default(""),
+        lastName: z.string().max(200).default(""),
+        phone: z.string().max(60).default(""),
+        email: z.string().max(200).default(""),
+        notes: z.string().max(2000).default(""),
+      }),
+    )
+    .min(1)
+    .max(MAX_IMPORT_ROWS),
+  /** Customers already there (same mobile, or else email) get the file's details. */
+  update: z.boolean().default(true),
+  apply: z.boolean().default(false),
+});
+export type CustomerImportInput = z.input<typeof customerImportSchema>;
+
+/**
+ * One imported row: a first name and a way to reach them; lists often have no last name.
+ * Numbers without a country code are read as the business's country.
+ */
+export function importedCustomerSchema(country?: string | null) {
+  return z
+    .object({
+      firstName: personName,
+      lastName: z.string().transform(tidyName).pipe(z.string().max(100)),
+      phone: phoneField(country),
+      email: optionalEmail,
+      notes: optionalText(1000),
+    })
+    .superRefine(requireContact);
+}
+
 /**
  * An appointment the business books itself: an existing customer, or a new one's details
  * (matched by phone or email like online bookings).
  */
 export const staffBookingSchema = z
   .object({
+    /** Needed when the business has more than one active location. */
+    locationId: z.string().min(1).optional(),
     serviceId: z.string().min(1),
     /** A professional, or null for whoever is free. */
     resourceId: z.string().min(1).nullable(),
@@ -505,10 +609,32 @@ function contactField(
 }
 
 /**
+ * A detail the form may ask for: dropped when it isn't asked (or for forms saved before it
+ * existed), and required when the business says so.
+ */
+function askedField<T>(rule: FieldRule | undefined, field: z.ZodType<T | null | undefined>) {
+  if (!rule || rule === "hidden") {
+    return z
+      .unknown()
+      .optional()
+      .transform((): T | null => null);
+  }
+  const value = field.transform((given) => given ?? null);
+  if (rule === "optional") return value;
+  return value.superRefine((given, ctx) => {
+    if (given === null) ctx.addIssue({ code: "custom", message: "required" });
+  });
+}
+
+/**
  * The customer details and answers a booking needs, following the business's form. Used
  * by the booking page and the server, so both apply the same rules.
  */
-export function bookingDetailsSchema(form: BookingForm, country?: string | null) {
+export function bookingDetailsSchema(
+  // The input shape: forms saved before a field existed don't have it.
+  form: z.input<typeof bookingFormSchema>,
+  country?: string | null,
+) {
   return z.object({
     customer: z.object({
       firstName: personName,
@@ -516,6 +642,9 @@ export function bookingDetailsSchema(form: BookingForm, country?: string | null)
       // Numbers typed without a country code are read as the business's country.
       phone: contactField(form.phone, phoneField(country)),
       email: contactField(form.email, optionalEmail),
+      birthDate: askedField(form.birthDate, optionalBirthDate),
+      document: askedField(form.document, optionalDocument),
+      gender: askedField(form.gender, optionalGender),
     }),
     answers: z
       .record(z.string(), z.string().max(1000))
@@ -528,7 +657,7 @@ export function bookingDetailsSchema(form: BookingForm, country?: string | null)
             if (question.required) {
               ctx.addIssue({ code: "custom", message: "required", path: [question.id] });
             }
-          } else if (question.type === "select" && !question.options.includes(value)) {
+          } else if (question.type === "select" && !(question.options ?? []).includes(value)) {
             ctx.addIssue({ code: "custom", message: "invalid_value", path: [question.id] });
           } else {
             answers.push({ id: question.id, label: question.label, value });
@@ -541,6 +670,8 @@ export function bookingDetailsSchema(form: BookingForm, country?: string | null)
 export type BookingDetails = z.output<ReturnType<typeof bookingDetailsSchema>>;
 
 export const bookingSchema = z.object({
+  /** Needed when the business has more than one active location. */
+  locationId: z.string().min(1).optional(),
   serviceId: z.string().min(1),
   /** A professional, or null for "anyone available" (or a business without professionals). */
   resourceId: z.string().min(1).nullable(),
@@ -552,8 +683,13 @@ export const bookingSchema = z.object({
     lastName: z.string(),
     phone: z.string().nullish(),
     email: z.string().nullish(),
+    birthDate: z.string().nullish(),
+    document: z.string().nullish(),
+    gender: z.string().nullish(),
   }),
   answers: z.record(z.string(), z.string()).nullish(),
+  /** A discount code the customer typed. */
+  giftCode: z.string().max(40).optional(),
   /** Honeypot: hidden from people, filled in by bots. Must stay empty. */
   website: z.string().max(0).optional(),
   /** Solved anti-bot puzzle (ALTCHA payload, base64 JSON), one per booking. */
@@ -586,6 +722,7 @@ export const AUTOMATION_TRIGGERS = [
   "created",
   "rescheduled",
   "cancelled",
+  "no_show",
   "before",
   "after",
 ] as const;
@@ -596,6 +733,7 @@ export const AUTOMATION_EVENTS: Record<AutomationTrigger, string> = {
   created: "appointment.created",
   rescheduled: "appointment.rescheduled",
   cancelled: "appointment.cancelled",
+  no_show: "appointment.no_show",
   before: "appointment.reminder",
   after: "appointment.followup",
 };
@@ -620,6 +758,8 @@ export const AUTOMATION_FIELDS = {
     "appointment.service",
     "appointment.duration_minutes",
     "appointment.professional",
+    "appointment.location",
+    "appointment.location_address",
     "appointment.price",
     "appointment.price_text",
     "appointment.booked_via",
@@ -992,12 +1132,444 @@ export type PasswordChangeInput = z.input<typeof passwordChangeSchema>;
  * The guided tours of the admin: "welcome" walks through every section the first time, and
  * each section has a short one for the first visit. Each is shown once per person.
  */
+// --- Sales ----------------------------------------------------------------
+
+/** How customers pay at the counter. OpenTurnly records it; it doesn't take payments. */
+export const PAYMENT_METHODS = ["cash", "card", "transfer", "other"] as const;
+export type PaymentMethod = (typeof PAYMENT_METHODS)[number];
+/** Plus what a sale can be paid with besides money: a deposit left before. */
+export const SALE_PAYMENT_METHODS = [...PAYMENT_METHODS, "deposit", "gift_card"] as const;
+export type SalePaymentMethod = (typeof SALE_PAYMENT_METHODS)[number];
+export const SALE_ITEM_KINDS = ["service", "product", "gift_card"] as const;
+export type SaleItemKind = (typeof SALE_ITEM_KINDS)[number];
+
+/** An amount in minor currency units. */
+const money = z.number().int().min(0).max(1e12);
+
+export const saleItemSchema = z
+  .object({
+    kind: z.enum(["service", "product"]),
+    /** For "product": what's sold; stock goes down at the sale's location. */
+    productId: z.string().min(1).optional(),
+    /** May be left out when charging an appointment whose service was deleted since. */
+    serviceId: z.string().min(1).nullable().default(null),
+    /** The appointment being charged, if the line is one. */
+    appointmentId: z.string().min(1).optional(),
+    /** Who did it, for commissions. */
+    resourceId: z.string().min(1).nullable().default(null),
+    quantity: z.number().int().min(1).max(999).default(1),
+    unitPrice: money,
+    discountAmount: money.default(0),
+  })
+  .refine(
+    (item) =>
+      item.kind === "product" ? Boolean(item.productId) : item.serviceId || item.appointmentId,
+    { message: "required", path: ["serviceId"] },
+  );
+export type SaleItemInput = z.input<typeof saleItemSchema>;
+
+export const salePaymentSchema = z.object({
+  method: z.enum(SALE_PAYMENT_METHODS),
+  amount: money,
+  /** For "deposit": which one. */
+  depositId: z.string().min(1).optional(),
+  /** For "gift_card": the card whose balance pays. */
+  giftCardId: z.string().min(1).optional(),
+});
+
+/**
+ * A sale: its lines, a discount on the whole, tips per professional and how it was paid.
+ * The payments must add up to the total plus the tips.
+ */
+export const saleSchema = z.object({
+  /** Without it, the location of the first appointment charged, or the only one. */
+  locationId: z.string().min(1).optional(),
+  customerId: z.string().min(1).nullable().default(null),
+  internal: z.boolean().default(false),
+  /** A discount code used at the counter: counts as one of its uses. */
+  giftCardId: z.string().min(1).optional(),
+  items: z.array(saleItemSchema).min(1).max(100),
+  discountAmount: money.default(0),
+  tips: z
+    .array(z.object({ resourceId: z.string().min(1), amount: money.min(1) }))
+    .max(50)
+    .default([]),
+  payments: z.array(salePaymentSchema).max(10),
+  note: optionalText(500),
+});
+export type SaleInput = z.input<typeof saleSchema>;
+
+/** Money left in advance by a customer, for an appointment or a later visit. */
+export const depositSchema = z.object({
+  customerId: z.string().min(1),
+  appointmentId: z.string().min(1).nullable().default(null),
+  locationId: z.string().min(1).optional(),
+  amount: money.min(1),
+  method: z.enum(PAYMENT_METHODS),
+  note: optionalText(300),
+});
+export type DepositInput = z.input<typeof depositSchema>;
+
+// --- Gift cards -------------------------------------------------------------
+
+/**
+ * "discount": a code that takes a percentage or an amount off, on the booking page or at
+ * the counter. "balance": a card sold (or given) with money on it, spent as a payment.
+ */
+export const GIFT_CARD_KINDS = ["discount", "balance"] as const;
+export type GiftCardKind = (typeof GIFT_CARD_KINDS)[number];
+
+/** "VERANO20", "GC-7K2M": letters, numbers and dashes; typed in any case. */
+export const giftCodeSchema = z
+  .string()
+  .trim()
+  .toUpperCase()
+  .regex(/^[A-Z0-9][A-Z0-9-]{2,23}$/, "invalid_code");
+
+const giftCardCommon = {
+  code: giftCodeSchema,
+  /** First and last day it works, in the business's time zone; null: no limit. */
+  validFrom: calendarDate.nullable().default(null),
+  validUntil: calendarDate.nullable().default(null),
+  customerId: z.string().min(1).nullable().default(null),
+  note: optionalText(300),
+};
+
+export const giftCardSchema = z
+  .discriminatedUnion("kind", [
+    z.object({
+      kind: z.literal("discount"),
+      ...giftCardCommon,
+      /** A percentage off, or else a fixed amount off (`amount`). */
+      percent: z.number().int().min(1).max(100).nullable().default(null),
+      amount: money.min(1).nullable().default(null),
+      /** How many times it can be used in all; null: no limit. */
+      maxUses: z.number().int().min(1).max(100_000).nullable().default(null),
+    }),
+    z.object({
+      kind: z.literal("balance"),
+      ...giftCardCommon,
+      amount: money.min(1),
+      /** How it was paid for, recorded as a sale; null when it's given away. */
+      paidWith: z.enum(PAYMENT_METHODS).nullable().default(null),
+      locationId: z.string().min(1).optional(),
+    }),
+  ])
+  .refine((card) => card.kind === "balance" || (card.percent === null) !== (card.amount === null), {
+    message: "percent_or_amount",
+    path: ["percent"],
+  })
+  .refine((card) => !card.validFrom || !card.validUntil || card.validFrom <= card.validUntil, {
+    message: "end_before_start",
+    path: ["validUntil"],
+  });
+export type GiftCardInput = z.input<typeof giftCardSchema>;
+
+export const giftCardPatchSchema = z
+  .object({
+    active: z.boolean(),
+    validFrom: calendarDate.nullable(),
+    validUntil: calendarDate.nullable(),
+    maxUses: z.number().int().min(1).max(100_000).nullable(),
+    note: optionalText(300),
+  })
+  .partial();
+
+// --- Products and stock -------------------------------------------------------
+
+/**
+ * The lists products are organised by, kept per business so everyone picks the same
+ * "Coca-Cola" instead of typing it differently each time.
+ */
+export const PRODUCT_ATTRIBUTE_KINDS = ["category", "brand"] as const;
+export type ProductAttributeKind = (typeof PRODUCT_ATTRIBUTE_KINDS)[number];
+
+/** What a product's content is measured in: "400 ml", "80 g", "12 unidades". */
+export const PRODUCT_UNITS = ["ml", "l", "g", "kg", "oz", "unit"] as const;
+export type ProductUnit = (typeof PRODUCT_UNITS)[number];
+
+/** How people write each unit, without accents: "gr", "litros", "und"… */
+const UNIT_WORDS: Record<ProductUnit, string[]> = {
+  ml: ["ml", "mls", "cc", "mililitro", "mililitros", "milliliter", "milliliters"],
+  l: ["l", "lt", "lts", "litro", "litros", "liter", "liters", "litre", "litres"],
+  g: ["g", "gr", "grs", "gramo", "gramos", "gram", "grams"],
+  kg: ["kg", "kgs", "kilo", "kilos", "kilogramo", "kilogramos", "kilogram", "kilograms"],
+  oz: ["oz", "onza", "onzas", "ounce", "ounces"],
+  unit: ["u", "un", "und", "unds", "ud", "uds", "unid", "unidad", "unidades", "unit", "units"],
+};
+
+/**
+ * A product's content as people write it: "400ml", "80 gr", "1,5 litros", "2 unidades",
+ * "Botella 500 ml", or just "Unidad" (one). Null when there's no number and unit in it.
+ */
+export function parseContent(text: string): { content: number; unit: ProductUnit } | null {
+  const plain = text
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .trim();
+  const unitOf = (word: string) =>
+    PRODUCT_UNITS.find((unit) => UNIT_WORDS[unit].includes(word.replace(/\.$/, "")));
+  const alone = unitOf(plain);
+  if (alone === "unit") return { content: 1, unit: "unit" };
+  const match = plain.match(/(\d+(?:[.,]\d+)?)\s*([a-z]+\.?)$/);
+  const unit = match?.[2] ? unitOf(match[2]) : undefined;
+  const content = Number(match?.[1]?.replace(",", "."));
+  return unit && content > 0 && content <= 1e6 ? { content, unit } : null;
+}
+
+/**
+ * What tells two entries of a list apart: case, accents, spaces and signs don't, so
+ * "Coca-Cola", "coca cola" and "CocaCola" are the same brand, and "400ml" is "400 ml".
+ */
+export function attributeKey(name: string): string {
+  return name
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]/g, "");
+}
+
+/** The usual IVA (VAT) by country, in percent, offered when a price includes it. */
+export const DEFAULT_TAX_RATES: Record<string, number> = {
+  AR: 21,
+  BO: 13,
+  CL: 19,
+  CO: 19,
+  CR: 13,
+  DO: 18,
+  EC: 15,
+  ES: 21,
+  GT: 12,
+  HN: 15,
+  MX: 16,
+  NI: 15,
+  PA: 7,
+  PE: 18,
+  PY: 10,
+  SV: 13,
+  UY: 22,
+  VE: 16,
+};
+
+export const productAttributeSchema = z.object({
+  kind: z.enum(PRODUCT_ATTRIBUTE_KINDS),
+  /** "Cuidado capilar", "Pantene". */
+  name: z
+    .string()
+    .trim()
+    .transform((value) => value.replace(/\s+/g, " "))
+    .pipe(z.string().min(1).max(80)),
+});
+export type ProductAttributeInput = z.input<typeof productAttributeSchema>;
+
+/** How a product's own commission is given: a percent of the sale or an amount per unit. */
+export const COMMISSION_TYPES = ["percent", "fixed"] as const;
+export type CommissionType = (typeof COMMISSION_TYPES)[number];
+
+const listId = z.string().min(1).nullable().default(null);
+
+const productFields = z.object({
+  name: z.string().trim().min(1).max(160),
+  /** Barcode or the business's own reference; what a bulk upload recognises it by. */
+  sku: optionalText(60),
+  categoryId: listId,
+  brandId: listId,
+  /** How much it holds, in `unit`: 400 (ml). Both or neither. */
+  content: z.number().positive().max(1e6).nullable().default(null),
+  unit: z.enum(PRODUCT_UNITS).nullable().default(null),
+  description: optionalText(1000),
+  /** Sale price, price for the team (internal sales) and what it costs, in minor units. */
+  priceAmount: money,
+  internalPriceAmount: money.nullable().default(null),
+  costAmount: money.nullable().default(null),
+  /** Paid to whoever sells it, instead of their usual product commission. */
+  commissionValue: z.number().min(0).max(1e12).nullable().default(null),
+  commissionType: z.enum(COMMISSION_TYPES).default("percent"),
+  /** The price includes this IVA (VAT), in percent; null when it doesn't say. */
+  taxRate: z.number().min(0).max(100).nullable().default(null),
+  /** Sold to customers; off for supplies used only in the services. */
+  forSale: z.boolean().default(true),
+  active: z.boolean().default(true),
+  /** Units already there when it's created, by location. */
+  initialStock: z
+    .array(z.object({ locationId: z.string().min(1), quantity: z.number().int().min(0).max(1e6) }))
+    .max(100)
+    .optional(),
+  /** A warning shows when stock at a location goes down to `alertAt`; null: no warning. */
+  alerts: z
+    .array(
+      z.object({
+        locationId: z.string().min(1),
+        alertAt: z.number().int().min(0).max(1e6).nullable(),
+      }),
+    )
+    .max(100)
+    .optional(),
+});
+
+/** A percent commission can't be over 100. */
+const commissionFits = (value: { commissionType?: string; commissionValue?: number | null }) =>
+  value.commissionType !== "percent" ||
+  value.commissionValue === null ||
+  value.commissionValue === undefined ||
+  value.commissionValue <= 100;
+
+/** "400" needs its unit, and a unit needs how many: the field that's missing, if one is. */
+export function missingContentField(value: {
+  content?: number | null;
+  unit?: string | null;
+}): "content" | "unit" | null {
+  const content = value.content ?? null;
+  const unit = value.unit ?? null;
+  if (content !== null && unit === null) return "unit";
+  if (content === null && unit !== null) return "content";
+  return null;
+}
+
+export const productSchema = productFields
+  .refine(commissionFits, { message: "too_big", path: ["commissionValue"] })
+  .superRefine((value, context) => {
+    const missing = missingContentField(value);
+    if (missing) context.addIssue({ code: "custom", message: "required", path: [missing] });
+  });
+/**
+ * Changes to a product: any of its fields. Defaults fill in what wasn't sent, so the server
+ * keeps only the fields in the request, and checks the commission and content as a whole.
+ */
+export const productUpdateSchema = productFields.partial();
+export type ProductInput = z.input<typeof productSchema>;
+
+/**
+ * A bulk upload of products, as the cells say (numbers are read on the server, which knows
+ * the currency). Recognised by barcode, else by name, brand and content; new categories and
+ * brands are created on the way.
+ */
+export const MAX_PRODUCT_IMPORT_ROWS = 5000;
+const cell = z.string().max(2000).default("");
+export const productImportSchema = z.object({
+  rows: z
+    .array(
+      z.object({
+        sku: cell,
+        name: cell,
+        category: cell,
+        brand: cell,
+        /** "400 ml", "80 g", "2 unidades". */
+        content: cell,
+        cost: cell,
+        price: cell,
+        internalPrice: cell,
+        commission: cell,
+        commissionType: cell,
+        description: cell,
+        status: cell,
+        taxIncluded: cell,
+        taxRate: cell,
+        /** Units counted at each location (by location id); empty leaves it as it is. */
+        stock: z.record(z.string(), cell).default({}),
+      }),
+    )
+    .min(1)
+    .max(MAX_PRODUCT_IMPORT_ROWS),
+  apply: z.boolean().default(false),
+});
+export type ProductImportInput = z.input<typeof productImportSchema>;
+
+/**
+ * What moves stock by hand. "purchase": units come in. "adjustment": a count, which sets
+ * the stock to `quantity`. "internal": used by the business. "transfer": to another location.
+ * Sales and voided sales move stock on their own ("sale", "return").
+ */
+export const MANUAL_STOCK_KINDS = ["purchase", "adjustment", "internal", "transfer"] as const;
+export const STOCK_MOVEMENT_KINDS = [
+  "purchase",
+  "adjustment",
+  "internal",
+  "transfer_out",
+  "transfer_in",
+  "sale",
+  "return",
+] as const;
+export type StockMovementKind = (typeof STOCK_MOVEMENT_KINDS)[number];
+
+export const stockMovementSchema = z
+  .object({
+    kind: z.enum(MANUAL_STOCK_KINDS),
+    productId: z.string().min(1),
+    locationId: z.string().min(1),
+    /** Units in or out; for an adjustment, the units counted. */
+    quantity: z.number().int().min(0).max(1e6),
+    toLocationId: z.string().min(1).optional(),
+    /** For purchases: what each unit cost. */
+    unitCost: money.nullable().default(null),
+    note: optionalText(300),
+  })
+  .refine((move) => move.kind === "adjustment" || move.quantity > 0, {
+    message: "too_small",
+    path: ["quantity"],
+  })
+  .refine(
+    (move) =>
+      move.kind !== "transfer" || (move.toLocationId && move.toLocationId !== move.locationId),
+    {
+      message: "required",
+      path: ["toLocationId"],
+    },
+  );
+export type StockMovementInput = z.input<typeof stockMovementSchema>;
+
+// --- Cash register --------------------------------------------------------
+
+/**
+ * Money that moves outside of sales. "income" and "expense": other income and expenses.
+ * "transfer_out"/"transfer_in": cash taken out of a location's drawer (to the bank, or to
+ * another location). "adjustment": the cash counted differs from what was expected.
+ */
+export const CASH_MOVEMENT_KINDS = [
+  "income",
+  "expense",
+  "transfer_out",
+  "transfer_in",
+  "adjustment",
+] as const;
+export type CashMovementKind = (typeof CASH_MOVEMENT_KINDS)[number];
+
+export const cashMovementSchema = z.discriminatedUnion("kind", [
+  z.object({
+    kind: z.enum(["income", "expense"]),
+    locationId: z.string().min(1),
+    amount: money.min(1),
+    method: z.enum(PAYMENT_METHODS),
+    /** "Arriendo", "Proveedor", "Servicios públicos"… free text with suggestions. */
+    category: optionalText(80),
+    description: optionalText(300),
+  }),
+  z.object({
+    kind: z.literal("transfer"),
+    locationId: z.string().min(1),
+    amount: money.min(1),
+    /** Another location's drawer; left out, the cash leaves (to the bank). */
+    toLocationId: z.string().min(1).optional(),
+    description: optionalText(300),
+  }),
+  z.object({
+    kind: z.literal("adjustment"),
+    locationId: z.string().min(1),
+    /** The cash counted in the drawer: it becomes the cash in the register. */
+    counted: money,
+    description: optionalText(300),
+  }),
+]);
+export type CashMovementInput = z.input<typeof cashMovementSchema>;
+
 export const TOURS = [
   "welcome",
   "agenda",
   "customers",
   "services",
   "professionals",
+  "locations",
   "hours",
   "settings",
 ] as const;

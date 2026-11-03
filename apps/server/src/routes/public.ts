@@ -11,10 +11,14 @@ import {
 } from "@openturnly/core";
 import { and, asc, count, eq, gt, inArray, lt, sql } from "drizzle-orm";
 import { type Context, Hono } from "hono";
+import { z } from "zod";
 import {
   appointments,
   type Business,
   businesses,
+  locationServices,
+  resourceLocations,
+  resourcePhotos,
   resourceServices,
   resources,
   services,
@@ -23,15 +27,19 @@ import { bearerToken, findApiKey } from "../lib/api-keys.ts";
 import { clientIp, networkKey } from "../lib/client-ip.ts";
 import { newBookingCode } from "../lib/codes.ts";
 import { matchCustomer, saveBookingCustomer } from "../lib/customers.ts";
+import { discountFor, usableGiftCard } from "../lib/gift-cards.ts";
 import { businessCountry } from "../lib/holidays.ts";
 import { type AppEnv, apiError, type Deps, parseBody, validateWith } from "../lib/http.ts";
-import { findImage, imageUrls } from "../lib/images.ts";
+import { findImage, imageUrls, photoUrls } from "../lib/images.ts";
+import { listLocations, resolveLocation } from "../lib/locations.ts";
 import { bookingRules, loadSchedules, pickLeastBusy } from "../lib/schedules.ts";
 
 /** Longest range the booking calendar can ask for at once. */
 const MAX_AVAILABILITY_DAYS = 62;
 /** Upcoming bookings one customer can hold at the same business. */
 const MAX_ACTIVE_BOOKINGS_PER_CUSTOMER = 3;
+
+const giftCheckSchema = z.object({ code: z.string().min(1).max(40), serviceId: z.string().min(1) });
 
 /** Endpoints used by the public booking page. No login required. */
 export function publicRoutes({ db, config, guard, automations }: Deps) {
@@ -58,51 +66,92 @@ export function publicRoutes({ db, config, guard, automations }: Deps) {
     return business;
   };
 
-  /** Active services and professionals, keeping only services someone can actually do. */
+  /**
+   * Active locations with the services each can actually take bookings for and who works
+   * there, and the services and professionals across them. A location without
+   * professionals takes bookings on its own hours for every service it offers.
+   */
   const loadCatalog = async (business: Business) => {
+    const places = (await listLocations(db, business.id)).filter((place) => place.active);
     const team = await db
       .select({ id: resources.id, name: resources.name })
       .from(resources)
       .where(and(eq(resources.businessId, business.id), eq(resources.active, true)))
       .orderBy(asc(resources.position), asc(resources.name));
-    const links =
+    const teamIds = new Set(team.map((member) => member.id));
+    const placeIds = places.map((place) => place.id);
+    const [links, staffed, offered] = await Promise.all([
       team.length > 0
-        ? await db
+        ? db
             .select()
             .from(resourceServices)
-            .where(
-              inArray(
-                resourceServices.resourceId,
-                team.map((member) => member.id),
-              ),
-            )
-        : [];
-    const offered = new Set(links.map((link) => link.serviceId));
-    const catalog = (
-      await db
-        .select({
-          id: services.id,
-          name: services.name,
-          description: services.description,
-          durationMin: services.durationMin,
-          priceAmount: services.priceAmount,
-        })
-        .from(services)
-        .where(and(eq(services.businessId, business.id), eq(services.active, true)))
-        .orderBy(asc(services.position), asc(services.name))
-    ).filter((service) => team.length === 0 || offered.has(service.id));
-    const bookable = new Set(catalog.map((service) => service.id));
+            .where(inArray(resourceServices.resourceId, [...teamIds]))
+        : [],
+      placeIds.length > 0
+        ? db.select().from(resourceLocations).where(inArray(resourceLocations.locationId, placeIds))
+        : [],
+      placeIds.length > 0
+        ? db.select().from(locationServices).where(inArray(locationServices.locationId, placeIds))
+        : [],
+    ]);
+    const catalog = await db
+      .select({
+        id: services.id,
+        name: services.name,
+        description: services.description,
+        category: services.category,
+        durationMin: services.durationMin,
+        priceAmount: services.priceAmount,
+      })
+      .from(services)
+      .where(and(eq(services.businessId, business.id), eq(services.active, true)))
+      .orderBy(asc(services.position), asc(services.name));
+
+    const doing = (resourceId: string, serviceId: string) =>
+      links.some((link) => link.resourceId === resourceId && link.serviceId === serviceId);
+    const bookableLocations = places
+      .map((place) => {
+        const here = staffed
+          .filter((link) => link.locationId === place.id && teamIds.has(link.resourceId))
+          .map((link) => link.resourceId);
+        const serviceIds = catalog
+          .filter(
+            (service) =>
+              offered.some(
+                (link) => link.locationId === place.id && link.serviceId === service.id,
+              ) &&
+              (here.length === 0 || here.some((resourceId) => doing(resourceId, service.id))),
+          )
+          .map((service) => service.id);
+        return {
+          id: place.id,
+          name: place.name,
+          address: place.address,
+          phone: place.phone,
+          serviceIds,
+          professionalIds: here.filter((resourceId) =>
+            serviceIds.some((serviceId) => doing(resourceId, serviceId)),
+          ),
+        };
+      })
+      // A location with nothing bookable would lead customers to an empty list.
+      .filter((place) => place.serviceIds.length > 0);
+
+    const bookable = new Set(bookableLocations.flatMap((place) => place.serviceIds));
+    const working = new Set(bookableLocations.flatMap((place) => place.professionalIds));
+    const photos = await photoUrls(db, business.slug, [...working]);
     return {
-      services: catalog,
-      // Someone with nothing bookable would lead customers to an empty list.
+      locations: bookableLocations,
+      services: catalog.filter((service) => bookable.has(service.id)),
       professionals: team
+        .filter((member) => working.has(member.id))
         .map((member) => ({
           ...member,
+          photoUrl: photos.get(member.id) ?? null,
           serviceIds: links
             .filter((link) => link.resourceId === member.id && bookable.has(link.serviceId))
             .map((link) => link.serviceId),
-        }))
-        .filter((member) => member.serviceIds.length > 0),
+        })),
     };
   };
 
@@ -160,6 +209,26 @@ export function publicRoutes({ db, config, guard, automations }: Deps) {
         });
       })
 
+      .get("/businesses/:slug/professionals/:resourceId/photo", async (c) => {
+        const business = await findBusiness(c.req.param("slug"));
+        const [photo] = await db
+          .select({ contentType: resourcePhotos.contentType, data: resourcePhotos.data })
+          .from(resourcePhotos)
+          .innerJoin(resources, eq(resources.id, resourcePhotos.resourceId))
+          .where(
+            and(
+              eq(resources.businessId, business.id),
+              eq(resourcePhotos.resourceId, c.req.param("resourceId")),
+            ),
+          );
+        if (!photo) throw apiError(404, "not_found");
+        // URLs carry the upload time (?v=…), so a new upload gets a new URL.
+        return c.body(new Uint8Array(photo.data), 200, {
+          "Content-Type": photo.contentType,
+          "Cache-Control": "public, max-age=31536000, immutable",
+        });
+      })
+
       /**
        * Free start times per date, { days: { "2026-10-24": ["09:00", "09:30"] } }, and who
        * is free at each one, { staff: { "2026-10-24": { "09:00": [id, …] } } }, so the
@@ -169,6 +238,28 @@ export function publicRoutes({ db, config, guard, automations }: Deps) {
        * A puzzle to solve before booking, harder while the business gets an unusual
        * number of bookings (see lib/booking-guard.ts).
        */
+      /**
+       * Whether a discount code works for a service, and how much it takes off. Limited like
+       * the availability lookups, so codes can't be guessed by trying many.
+       */
+      .post("/businesses/:slug/gift-code", async (c) => {
+        const business = await findBusiness(c.req.param("slug"));
+        if (!(await agentKey(c, business)) && !guard.allow.availability(network(c))) {
+          throw apiError(429, "too_many_requests");
+        }
+        const input = await parseBody(c, giftCheckSchema);
+        const service = await findActiveService(business, input.serviceId);
+        const card = await usableGiftCard(db, business, { code: input.code }, "discount");
+        const price = service.priceAmount ?? 0;
+        return c.json({
+          code: card.code,
+          percent: card.percent,
+          amount: card.amount,
+          priceAmount: price,
+          discountAmount: discountFor(card, price),
+        });
+      })
+
       .get("/businesses/:slug/challenge", async (c) => {
         if (!guard.allow.challenge(network(c))) throw apiError(429, "too_many_requests");
         const business = await findBusiness(c.req.param("slug"));
@@ -182,15 +273,17 @@ export function publicRoutes({ db, config, guard, automations }: Deps) {
         if (!(await agentKey(c, business)) && !guard.allow.availability(network(c))) {
           throw apiError(429, "too_many_requests");
         }
-        const { serviceId = "", resourceId, from = "", to = "" } = c.req.query();
+        const { serviceId = "", resourceId, locationId, from = "", to = "" } = c.req.query();
         if (!isDateString(from) || !isDateString(to) || to < from) {
           throw apiError(400, "invalid_range");
         }
         if (to > addDays(from, MAX_AVAILABILITY_DAYS)) throw apiError(400, "invalid_range");
+        const location = await resolveLocation(db, business.id, locationId, { forBooking: true });
         const service = await findActiveService(business, serviceId);
         const schedules = await loadSchedules(
           db,
           business,
+          location.id,
           service.id,
           resourceId || null,
           from,
@@ -246,6 +339,9 @@ export function publicRoutes({ db, config, guard, automations }: Deps) {
             throw apiError(429, "too_many_requests");
           }
         }
+        const location = await resolveLocation(db, business.id, input.locationId, {
+          forBooking: true,
+        });
         const service = await findActiveService(business, input.serviceId);
         const now = Date.now();
         const startsAt = zonedTimeToInstant(input.date, parseTime(input.time), business.timezone);
@@ -292,6 +388,7 @@ export function publicRoutes({ db, config, guard, automations }: Deps) {
           const schedules = await loadSchedules(
             tx,
             business,
+            location.id,
             service.id,
             input.resourceId,
             input.date,
@@ -314,6 +411,11 @@ export function publicRoutes({ db, config, guard, automations }: Deps) {
                 .where(eq(resources.id, resourceId))
             : [];
 
+          // Checked in the booking queue, so a code's last use goes to one booking only.
+          const gift = input.giftCode?.trim()
+            ? await usableGiftCard(tx, business, { code: input.giftCode }, "discount")
+            : null;
+
           const customerId = await saveBookingCustomer(tx, business.id, match, details);
 
           const [created] = await tx
@@ -321,6 +423,7 @@ export function publicRoutes({ db, config, guard, automations }: Deps) {
             .values({
               code: await newBookingCode(tx),
               businessId: business.id,
+              locationId: location.id,
               serviceId: service.id,
               resourceId,
               customerId,
@@ -329,6 +432,8 @@ export function publicRoutes({ db, config, guard, automations }: Deps) {
               serviceName: service.name,
               resourceName: resource?.name ?? null,
               priceAmount: service.priceAmount,
+              discountAmount: gift ? discountFor(gift, service.priceAmount ?? 0) : 0,
+              giftCardId: gift?.id ?? null,
               answers,
               source: key ? "agent" : "online",
               sourceLabel: key?.name ?? null,
@@ -352,7 +457,9 @@ export function publicRoutes({ db, config, guard, automations }: Deps) {
               serviceName: appointment.serviceName,
               resourceName: appointment.resourceName,
               priceAmount: appointment.priceAmount,
+              discountAmount: appointment.discountAmount,
               currency: business.currency,
+              location: { name: location.name, address: location.address },
             },
           },
           201,

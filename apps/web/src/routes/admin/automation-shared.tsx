@@ -14,6 +14,7 @@ import {
   CalendarX,
   type LucideIcon,
   MessageSquareHeart,
+  UserX,
 } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { Badge } from "../../components/ui.tsx";
@@ -25,6 +26,7 @@ export const TRIGGERS: { value: AutomationTrigger; icon: LucideIcon }[] = [
   { value: "created", icon: CalendarPlus },
   { value: "rescheduled", icon: CalendarClock },
   { value: "cancelled", icon: CalendarX },
+  { value: "no_show", icon: UserX },
   { value: "before", icon: BellRing },
   { value: "after", icon: MessageSquareHeart },
 ];
@@ -118,6 +120,8 @@ export function sampleValues(business: Business, event: string, language: string
       service: "Corte clásico",
       duration_minutes: 30,
       professional: "Juan",
+      location: business.name,
+      location_address: business.address,
       price: 18000,
       price_text: "$ 18.000",
       booked_via: "online",

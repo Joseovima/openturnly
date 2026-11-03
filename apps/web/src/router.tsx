@@ -1,5 +1,5 @@
 import { useTranslation } from "react-i18next";
-import { createBrowserRouter, Link } from "react-router";
+import { createBrowserRouter, Link, Navigate } from "react-router";
 import { buttonClass } from "./components/ui.tsx";
 import { PublicBookingPage } from "./routes/public-page.tsx";
 
@@ -31,13 +31,22 @@ export const router = createBrowserRouter([
     lazy: page("AdminLayout"),
     children: [
       { index: true, lazy: page("BusinessesPage") },
+      { path: "businesses", element: <Navigate to="/admin" replace /> },
       { path: "businesses/new", lazy: page("NewBusinessPage") },
+      // Links from before short ids: /admin/businesses/<uuid>/… → /admin/<short id>/….
+      { path: "businesses/:businessId/*", lazy: page("LegacyBusinessRedirect") },
       {
-        path: "businesses/:businessId",
+        path: ":businessCode",
         lazy: page("BusinessLayout"),
         children: [
           { index: true, lazy: page("AgendaPage") },
+          { path: "sales", lazy: page("SalesPage") },
+          { path: "cash", lazy: page("CashPage") },
+          { path: "gift-cards", lazy: page("GiftCardsPage") },
+          { path: "inventory", lazy: page("InventoryPage") },
+          { path: "reports", lazy: page("ReportsPage") },
           { path: "customers", lazy: page("CustomersPage") },
+          { path: "locations", lazy: page("LocationsPage") },
           { path: "services", lazy: page("ServicesPage") },
           { path: "professionals", lazy: page("ProfessionalsPage") },
           { path: "hours", lazy: page("HoursPage") },

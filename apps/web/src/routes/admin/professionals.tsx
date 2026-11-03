@@ -1,8 +1,9 @@
 import { formatPrice, type ProfessionalInput, professionalSchema } from "@openturnly/core";
-import { Pencil, Plus, Users } from "lucide-react";
-import { type FormEvent, useState } from "react";
+import { Camera, Pencil, Plus, Users } from "lucide-react";
+import { type FormEvent, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { Link } from "react-router";
+import { Avatar } from "../../components/avatar.tsx";
 import { Checklist } from "../../components/checklist.tsx";
 import { useConfirm } from "../../components/confirm.tsx";
 import { EmptyState, Modal, PageHeader, Switch } from "../../components/controls.tsx";
@@ -12,13 +13,16 @@ import { Alert, Badge, Button, Field, Input, Spinner } from "../../components/ui
 import { WeeklyHoursEditor } from "../../components/weekly-hours.tsx";
 import type { Professional, WeeklyRange } from "../../lib/api.ts";
 import {
-  useHours,
+  type LocationHours,
+  useHoursAt,
+  useLocations,
   useProfessionalMutations,
   useProfessionals,
   useServices,
 } from "../../lib/catalog.ts";
 import { formatDuration } from "../../lib/format.ts";
 import { errorMessage, type FieldErrors, fieldMessage, validate } from "../../lib/forms.ts";
+import { prepareImage } from "../../lib/images.ts";
 import { useBusinessContext } from "./business.tsx";
 
 export function ProfessionalsPage() {
@@ -26,11 +30,14 @@ export function ProfessionalsPage() {
   const { business } = useBusinessContext();
   const professionals = useProfessionals(business.id);
   const services = useServices(business.id);
-  // The form starts from the current hours, so wait for them before opening it.
-  const hours = useHours(business.id);
+  const locations = useLocations(business.id);
+  // The form starts from the current hours at each location, so wait for them.
+  const hours = useHoursAt(business.id, locations.data?.map((location) => location.id) ?? []);
   const [editing, setEditing] = useState<Professional | "new" | null>(null);
 
   const serviceNames = new Map(services.data?.map((service) => [service.id, service.name]));
+  const locationNames = new Map(locations.data?.map((location) => [location.id, location.name]));
+  const severalLocations = (locations.data?.length ?? 0) > 1;
 
   const newButton = (
     <Button data-tour="professionals-new" onClick={() => setEditing("new")}>
@@ -44,7 +51,12 @@ export function ProfessionalsPage() {
       key: "name",
       header: t("professionals.colProfessional"),
       cell: (professional) => (
-        <IdentityCell initial={professional.name} title={professional.name} />
+        <IdentityCell
+          initial={professional.name}
+          imageUrl={professional.photoUrl}
+          round
+          title={professional.name}
+        />
       ),
     },
     {
@@ -64,6 +76,25 @@ export function ProfessionalsPage() {
         );
       },
     },
+    ...(severalLocations
+      ? [
+          {
+            key: "locations",
+            header: t("professionals.colLocations"),
+            className: "hidden lg:table-cell",
+            cell: (professional: Professional) => {
+              const names = professional.locationIds
+                .map((id) => locationNames.get(id))
+                .filter((name): name is string => Boolean(name));
+              return (
+                <span className="block max-w-xs truncate text-zinc-600" title={names.join(", ")}>
+                  {names.join(", ") || "—"}
+                </span>
+              );
+            },
+          },
+        ]
+      : []),
     {
       key: "hours",
       header: t("professionals.colHours"),
@@ -127,9 +158,10 @@ export function ProfessionalsPage() {
           empty={t("professionals.emptyTitle")}
         />
       )}
-      {editing && services.data && hours.data && (
+      {editing && services.data && locations.data && hours && (
         <ProfessionalForm
           professional={editing === "new" ? null : editing}
+          hours={hours}
           onClose={() => setEditing(null)}
         />
       )}
@@ -139,15 +171,19 @@ export function ProfessionalsPage() {
 
 function ProfessionalForm({
   professional,
+  hours,
   onClose,
 }: {
   professional: Professional | null;
+  /** Hours at every location of the business. */
+  hours: Record<string, LocationHours>;
   onClose: () => void;
 }) {
   const { t } = useTranslation();
   const { business } = useBusinessContext();
   const services = useServices(business.id);
-  const hours = useHours(business.id);
+  const locations = useLocations(business.id).data ?? [];
+  const severalLocations = locations.length > 1;
   const { save, remove } = useProfessionalMutations(business.id);
   const confirm = useConfirm();
 
@@ -156,21 +192,59 @@ function ProfessionalForm({
   const [serviceIds, setServiceIds] = useState<string[]>(
     professional?.serviceIds ?? services.data?.map((service) => service.id) ?? [],
   );
-  const ownHours = professional ? (hours.data?.professionals[professional.id] ?? []) : [];
-  const [customHours, setCustomHours] = useState(ownHours.length > 0);
-  const [weekly, setWeekly] = useState<WeeklyRange[]>(
-    ownHours.length > 0 ? ownHours : (hours.data?.business ?? []),
+  const [serviceCommission, setServiceCommission] = useState(
+    String(professional?.serviceCommission ?? 0),
   );
+  const [productCommission, setProductCommission] = useState(
+    String(professional?.productCommission ?? 0),
+  );
+  const [locationIds, setLocationIds] = useState<string[]>(
+    professional?.locationIds ?? locations.map((location) => location.id),
+  );
+  /** Their own hours at a location, or none when they follow the location's. */
+  const ownAt = (locationId: string) =>
+    (professional && hours[locationId]?.professionals[professional.id]) || [];
+  const [customHours, setCustomHours] = useState<Record<string, boolean>>(() =>
+    Object.fromEntries(locations.map((location) => [location.id, ownAt(location.id).length > 0])),
+  );
+  const [weekly, setWeekly] = useState<Record<string, WeeklyRange[]>>(() =>
+    Object.fromEntries(
+      locations.map((location) => {
+        const own = ownAt(location.id);
+        return [location.id, own.length > 0 ? own : (hours[location.id]?.business ?? [])];
+      }),
+    ),
+  );
+  /** A new photo, null to remove theirs, or undefined to keep it as it is. */
+  const [photo, setPhoto] = useState<Blob | null | undefined>(undefined);
   const [errors, setErrors] = useState<FieldErrors>({});
+  const workplaces = locations.filter((location) => locationIds.includes(location.id));
 
   const submit = (event: FormEvent) => {
     event.preventDefault();
-    const values: ProfessionalInput = { name, active, serviceIds };
+    const values: ProfessionalInput = {
+      name,
+      active,
+      serviceIds,
+      locationIds,
+      serviceCommission: Number(serviceCommission.replace(",", ".")) || 0,
+      productCommission: Number(productCommission.replace(",", ".")) || 0,
+    };
     const result = validate(professionalSchema, values);
     setErrors(result.errors ?? {});
     if (!result.data) return;
     save.mutate(
-      { id: professional?.id, input: result.data, hours: customHours ? weekly : [] },
+      {
+        id: professional?.id,
+        input: result.data,
+        photo,
+        hours: Object.fromEntries(
+          workplaces.map((location) => [
+            location.id,
+            customHours[location.id] ? (weekly[location.id] ?? []) : [],
+          ]),
+        ),
+      },
       {
         onSuccess: () => {
           toast.success(professional ? t("common.saved") : t("professionals.created"));
@@ -226,11 +300,20 @@ function ProfessionalForm({
         {(save.isError || remove.isError) && (
           <Alert>{errorMessage(t, save.error ?? remove.error)}</Alert>
         )}
-        <Field label={t("fields.name")} error={fieldMessage(t, "name", errors.name)}>
-          {(props) => (
-            <Input {...props} value={name} onChange={(event) => setName(event.target.value)} />
-          )}
-        </Field>
+        <div className="flex items-start gap-4">
+          <PhotoField
+            name={name}
+            photo={photo === undefined ? (professional?.photoUrl ?? null) : photo}
+            onChange={setPhoto}
+          />
+          <div className="min-w-0 flex-1">
+            <Field label={t("fields.name")} error={fieldMessage(t, "name", errors.name)}>
+              {(props) => (
+                <Input {...props} value={name} onChange={(event) => setName(event.target.value)} />
+              )}
+            </Field>
+          </div>
+        </div>
 
         <fieldset className="space-y-2">
           <legend className="text-sm font-medium text-zinc-800">
@@ -261,16 +344,81 @@ function ProfessionalForm({
           )}
         </fieldset>
 
-        <div className="divide-y divide-zinc-100 border-t border-zinc-100">
-          <div className="space-y-3 py-4">
-            <Switch
-              checked={customHours}
-              onChange={setCustomHours}
-              label={t("professionals.customHours")}
-              description={t("professionals.customHoursHint")}
+        <div className="grid gap-4 sm:grid-cols-2">
+          {(
+            [
+              ["serviceCommission", serviceCommission, setServiceCommission],
+              ["productCommission", productCommission, setProductCommission],
+            ] as const
+          ).map(([key, value, set]) => (
+            <Field
+              key={key}
+              label={t(`professionals.${key}`)}
+              error={fieldMessage(t, key, errors[key])}
+            >
+              {(props) => (
+                <div className="relative">
+                  <Input
+                    {...props}
+                    inputMode="decimal"
+                    className="pr-8 text-right tabular-nums"
+                    value={value}
+                    onChange={(event) => set(event.target.value.replace(/[^\d.,]/g, ""))}
+                  />
+                  <span className="pointer-events-none absolute inset-y-0 right-3 flex items-center text-sm text-zinc-400">
+                    %
+                  </span>
+                </div>
+              )}
+            </Field>
+          ))}
+        </div>
+
+        {severalLocations && (
+          <fieldset className="space-y-2">
+            <legend className="text-sm font-medium text-zinc-800">
+              {t("professionals.locationsLabel")}
+            </legend>
+            <Checklist
+              label={t("professionals.locationsLabel")}
+              value={locationIds}
+              onChange={setLocationIds}
+              items={locations.map((location) => ({
+                id: location.id,
+                label: location.name,
+                detail: location.address ?? undefined,
+              }))}
             />
-            {customHours && <WeeklyHoursEditor value={weekly} onChange={setWeekly} />}
-          </div>
+          </fieldset>
+        )}
+
+        <div className="divide-y divide-zinc-100 border-t border-zinc-100">
+          {workplaces.map((location) => (
+            <div key={location.id} className="space-y-3 py-4">
+              <Switch
+                checked={customHours[location.id] ?? false}
+                onChange={(on) => setCustomHours((current) => ({ ...current, [location.id]: on }))}
+                label={
+                  severalLocations
+                    ? t("professionals.ownHoursAt", { name: location.name })
+                    : t("professionals.customHours")
+                }
+                description={
+                  severalLocations
+                    ? t("professionals.ownHoursAtHint")
+                    : t("professionals.customHoursHint")
+                }
+              />
+              {customHours[location.id] && (
+                <WeeklyHoursEditor
+                  value={weekly[location.id] ?? []}
+                  onChange={(value) =>
+                    setWeekly((current) => ({ ...current, [location.id]: value }))
+                  }
+                />
+              )}
+            </div>
+          ))}
           <div className="pt-4">
             <Switch
               checked={active}
@@ -282,5 +430,86 @@ function ProfessionalForm({
         </div>
       </form>
     </Modal>
+  );
+}
+
+/**
+ * Their photo for the booking page, optional: a circle that opens the file picker, with
+ * their initials until there's one. Saved with the rest of the form.
+ */
+function PhotoField({
+  name,
+  photo,
+  onChange,
+}: {
+  name: string;
+  /** The saved photo's URL, or the one just picked. */
+  photo: string | Blob | null;
+  onChange: (photo: Blob | null) => void;
+}) {
+  const { t } = useTranslation();
+  const input = useRef<HTMLInputElement>(null);
+  const [preview, setPreview] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!(photo instanceof Blob)) return setPreview(null);
+    const url = URL.createObjectURL(photo);
+    setPreview(url);
+    return () => URL.revokeObjectURL(url);
+  }, [photo]);
+  const url = photo instanceof Blob ? preview : photo;
+
+  const pick = async (file: File | undefined) => {
+    if (!file) return;
+    try {
+      // Square, like a logo.
+      onChange(await prepareImage(file, "logo"));
+    } catch {
+      toast.error(t("errors.image_invalid"));
+    }
+  };
+
+  return (
+    <div className="flex shrink-0 flex-col items-center gap-1.5">
+      <button
+        type="button"
+        onClick={() => input.current?.click()}
+        aria-label={url ? t("professionals.changePhoto") : t("professionals.addPhoto")}
+        title={t("professionals.photoHint")}
+        className="group relative rounded-full outline-none focus-visible:ring-2 focus-visible:ring-brand-500/40"
+      >
+        <Avatar name={name || "?"} url={url} className="size-16 text-lg" />
+        <span className="absolute inset-0 grid place-items-center rounded-full bg-black/40 text-[#fff] opacity-0 transition-opacity group-hover:opacity-100 group-focus-visible:opacity-100">
+          <Camera className="size-5" aria-hidden />
+        </span>
+      </button>
+      {url ? (
+        <button
+          type="button"
+          onClick={() => onChange(null)}
+          className="text-xs text-zinc-500 hover:text-red-600"
+        >
+          {t("professionals.removePhoto")}
+        </button>
+      ) : (
+        <button
+          type="button"
+          onClick={() => input.current?.click()}
+          className="text-xs font-medium text-brand-700 hover:underline"
+        >
+          {t("professionals.addPhoto")}
+        </button>
+      )}
+      <input
+        ref={input}
+        type="file"
+        accept="image/png,image/jpeg,image/webp"
+        className="hidden"
+        onChange={(event) => {
+          pick(event.target.files?.[0]);
+          event.target.value = "";
+        }}
+      />
+    </div>
   );
 }

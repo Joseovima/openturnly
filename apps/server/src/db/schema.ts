@@ -5,8 +5,18 @@ import {
   type BookingAnswer,
   type BookingForm,
   BUSINESS_ROLES,
+  CASH_MOVEMENT_KINDS,
+  COMMISSION_TYPES,
   DEFAULT_BOOKING_FORM,
+  GENDERS,
+  GIFT_CARD_KINDS,
   PAGE_THEMES,
+  PAYMENT_METHODS,
+  PRODUCT_ATTRIBUTE_KINDS,
+  PRODUCT_UNITS,
+  SALE_ITEM_KINDS,
+  SALE_PAYMENT_METHODS,
+  STOCK_MOVEMENT_KINDS,
 } from "@openturnly/core";
 import {
   type AnyPgColumn,
@@ -14,6 +24,7 @@ import {
   boolean,
   customType,
   date,
+  doublePrecision,
   index,
   integer,
   json,
@@ -132,6 +143,8 @@ export const userTours = pgTable(
 
 export const businesses = pgTable("businesses", {
   id: id(),
+  /** What admin URLs use instead of the id (/admin/<shortId>); see core's short-id. */
+  shortId: text("short_id").notNull().unique(),
   /** Public booking page lives at /<slug>. */
   slug: text("slug").notNull().unique(),
   name: text("name").notNull(),
@@ -241,6 +254,33 @@ export const businessImages = pgTable(
 );
 
 // ---------------------------------------------------------------------------
+// Locations: the places a business works from. Every business has at least one.
+// ---------------------------------------------------------------------------
+
+/**
+ * A branch of the business, with its own address, opening hours, services and people.
+ * All of a business's locations share its time zone, currency and booking rules.
+ */
+export const locations = pgTable(
+  "locations",
+  {
+    id: id(),
+    businessId: text("business_id")
+      .notNull()
+      .references(() => businesses.id, { onDelete: "cascade" }),
+    name: text("name").notNull(),
+    address: text("address"),
+    phone: text("phone"),
+    /** Inactive locations take no bookings and are hidden from the booking page. */
+    active: boolean("active").notNull().default(true),
+    position: integer("position").notNull().default(0),
+    createdAt: createdAt(),
+    updatedAt: updatedAt(),
+  },
+  (table) => [index("locations_business_id_idx").on(table.businessId)],
+);
+
+// ---------------------------------------------------------------------------
 // Catalog: what can be booked, and with whom
 // ---------------------------------------------------------------------------
 
@@ -253,6 +293,8 @@ export const services = pgTable(
       .references(() => businesses.id, { onDelete: "cascade" }),
     name: text("name").notNull(),
     description: text("description"),
+    /** Groups the booking page's menu ("Cortes", "Barba"…); null: no group. */
+    category: text("category"),
     durationMin: integer("duration_min").notNull(),
     /** Minor currency units. Null: price shown as "ask at the business". */
     priceAmount: bigint("price_amount", { mode: "number" }),
@@ -278,11 +320,27 @@ export const resources = pgTable(
     name: text("name").notNull(),
     active: boolean("active").notNull().default(true),
     position: integer("position").notNull().default(0),
+    /** Percent of each service and each product they sell that is theirs (commissions). */
+    serviceCommission: doublePrecision("service_commission").notNull().default(0),
+    productCommission: doublePrecision("product_commission").notNull().default(0),
     createdAt: createdAt(),
     updatedAt: updatedAt(),
   },
   (table) => [index("resources_business_id_idx").on(table.businessId)],
 );
+
+/**
+ * A professional's photo for the booking page, square and shrunk by the browser. Optional:
+ * without one, their initials show.
+ */
+export const resourcePhotos = pgTable("resource_photos", {
+  resourceId: text("resource_id")
+    .primaryKey()
+    .references(() => resources.id, { onDelete: "cascade" }),
+  contentType: text("content_type").notNull(),
+  data: bytea("data").notNull(),
+  updatedAt: updatedAt(),
+});
 
 /** Which services each professional offers. */
 export const resourceServices = pgTable(
@@ -301,13 +359,48 @@ export const resourceServices = pgTable(
   ],
 );
 
+/** Which services each location offers. */
+export const locationServices = pgTable(
+  "location_services",
+  {
+    locationId: text("location_id")
+      .notNull()
+      .references(() => locations.id, { onDelete: "cascade" }),
+    serviceId: text("service_id")
+      .notNull()
+      .references(() => services.id, { onDelete: "cascade" }),
+  },
+  (table) => [
+    primaryKey({ columns: [table.locationId, table.serviceId] }),
+    index("location_services_service_id_idx").on(table.serviceId),
+  ],
+);
+
+/** Where each professional works. Someone can work in several locations. */
+export const resourceLocations = pgTable(
+  "resource_locations",
+  {
+    resourceId: text("resource_id")
+      .notNull()
+      .references(() => resources.id, { onDelete: "cascade" }),
+    locationId: text("location_id")
+      .notNull()
+      .references(() => locations.id, { onDelete: "cascade" }),
+  },
+  (table) => [
+    primaryKey({ columns: [table.resourceId, table.locationId] }),
+    index("resource_locations_location_id_idx").on(table.locationId),
+  ],
+);
+
 // ---------------------------------------------------------------------------
 // Opening hours
 // ---------------------------------------------------------------------------
 
 /**
- * Weekly opening hours as wall-clock times in the business time zone.
- * `resourceId` null: the business hours. A professional without rows uses the business hours.
+ * Weekly opening hours as wall-clock times in the business time zone, per location.
+ * `resourceId` null: the location's hours. A professional without rows at a location
+ * works there on the location's hours.
  */
 export const weeklyHours = pgTable(
   "weekly_hours",
@@ -316,6 +409,9 @@ export const weeklyHours = pgTable(
     businessId: text("business_id")
       .notNull()
       .references(() => businesses.id, { onDelete: "cascade" }),
+    locationId: text("location_id")
+      .notNull()
+      .references(() => locations.id, { onDelete: "cascade" }),
     resourceId: text("resource_id").references(() => resources.id, { onDelete: "cascade" }),
     /** 0 = Sunday … 6 = Saturday */
     weekday: integer("weekday").notNull(),
@@ -325,7 +421,10 @@ export const weeklyHours = pgTable(
   (table) => [index("weekly_hours_business_id_idx").on(table.businessId)],
 );
 
-/** Days without bookings: holidays, vacations. `resourceId` null closes the whole business. */
+/**
+ * Days without bookings: holidays, vacations. A professional's closure applies wherever
+ * they work; otherwise `locationId` closes one location, or every one when null.
+ */
 export const closures = pgTable(
   "closures",
   {
@@ -333,6 +432,7 @@ export const closures = pgTable(
     businessId: text("business_id")
       .notNull()
       .references(() => businesses.id, { onDelete: "cascade" }),
+    locationId: text("location_id").references(() => locations.id, { onDelete: "cascade" }),
     resourceId: text("resource_id").references(() => resources.id, { onDelete: "cascade" }),
     /** First and last closed day (inclusive), "YYYY-MM-DD" in the business time zone. */
     date: date("date", { mode: "string" }).notNull(),
@@ -370,11 +470,18 @@ export const customers = pgTable(
     businessId: text("business_id")
       .notNull()
       .references(() => businesses.id, { onDelete: "cascade" }),
+    /** What admin URLs use instead of the id (?customer=<shortId>), unique per business. */
+    shortId: text("short_id").notNull(),
     /** Either may be missing, depending on the booking form; never both. */
     email: text("email"),
     phone: text("phone"),
     firstName: text("first_name").notNull(),
     lastName: text("last_name").notNull(),
+    /** Optional details, asked by the booking form if the business wants them. */
+    birthDate: date("birth_date", { mode: "string" }),
+    /** An ID number as they write it. */
+    document: text("document"),
+    gender: text("gender", { enum: GENDERS }),
     /** Private notes for the business ("prefers a fade"), never shown to the customer. */
     notes: text("notes"),
     createdAt: createdAt(),
@@ -382,11 +489,13 @@ export const customers = pgTable(
   },
   (table) => [
     uniqueIndex("customers_business_email_idx").on(table.businessId, table.email),
+    uniqueIndex("customers_business_short_id_idx").on(table.businessId, table.shortId),
     index("customers_business_phone_idx").on(table.businessId, table.phone),
   ],
 );
 
-export const APPOINTMENT_STATUSES = ["confirmed", "cancelled"] as const;
+/** "no_show": it was confirmed and the customer didn't come; it frees the time it had. */
+export const APPOINTMENT_STATUSES = ["confirmed", "cancelled", "no_show"] as const;
 export const APPOINTMENT_SOURCES = ["online", "admin", "agent"] as const;
 export type AppointmentStatus = (typeof APPOINTMENT_STATUSES)[number];
 
@@ -403,6 +512,8 @@ export const appointments = pgTable(
     businessId: text("business_id")
       .notNull()
       .references(() => businesses.id, { onDelete: "cascade" }),
+    /** Locations with appointments can't be deleted, only made inactive. */
+    locationId: text("location_id").references(() => locations.id, { onDelete: "set null" }),
     serviceId: text("service_id").references(() => services.id, { onDelete: "set null" }),
     resourceId: text("resource_id").references(() => resources.id, { onDelete: "set null" }),
     customerId: text("customer_id")
@@ -414,6 +525,11 @@ export const appointments = pgTable(
     serviceName: text("service_name").notNull(),
     resourceName: text("resource_name"),
     priceAmount: bigint("price_amount", { mode: "number" }),
+    /** Taken off the price by a discount code at booking (`giftCardId`). */
+    discountAmount: bigint("discount_amount", { mode: "number" }).notNull().default(0),
+    giftCardId: text("gift_card_id").references((): AnyPgColumn => giftCards.id, {
+      onDelete: "set null",
+    }),
     /** Answers to the business's extra questions, with each question as it was asked. */
     answers: jsonb("answers").$type<BookingAnswer[]>().notNull().default([]),
     /** Booking page, the business itself, or an AI agent through MCP (see source_label). */
@@ -428,7 +544,353 @@ export const appointments = pgTable(
     index("appointments_business_starts_idx").on(table.businessId, table.startsAt),
     index("appointments_resource_starts_idx").on(table.resourceId, table.startsAt),
     index("appointments_customer_idx").on(table.customerId),
+    index("appointments_location_starts_idx").on(table.locationId, table.startsAt),
     uniqueIndex("appointments_code_idx").on(table.code),
+  ],
+);
+
+// ---------------------------------------------------------------------------
+// Sales: what was charged, how it was paid and who got the tips
+// ---------------------------------------------------------------------------
+
+export const SALE_STATUSES = ["paid", "void"] as const;
+
+/**
+ * A sale at the counter: appointments charged, products sold… OpenTurnly records how the
+ * customer paid; it doesn't take payments itself. Amounts are in minor currency units.
+ * A void sale stays in the history but counts nowhere.
+ */
+export const sales = pgTable(
+  "sales",
+  {
+    id: id(),
+    businessId: text("business_id")
+      .notNull()
+      .references(() => businesses.id, { onDelete: "cascade" }),
+    /** Locations with sales can't be deleted, only made inactive. */
+    locationId: text("location_id").references(() => locations.id, { onDelete: "set null" }),
+    /** 1, 2, 3… per business, for receipts and for finding a sale. */
+    number: integer("number").notNull(),
+    /** Walk-in product sales may have no customer. */
+    customerId: text("customer_id").references(() => customers.id, { onDelete: "set null" }),
+    /** Sold to the team or used by the business itself ("ventas internas"). */
+    internal: boolean("internal").notNull().default(false),
+    /** A discount code used at the counter. */
+    giftCardId: text("gift_card_id").references((): AnyPgColumn => giftCards.id, {
+      onDelete: "set null",
+    }),
+    /** Sum of the lines, after each line's discount. */
+    subtotal: bigint("subtotal", { mode: "number" }).notNull(),
+    /** Discount on the whole sale. */
+    discountAmount: bigint("discount_amount", { mode: "number" }).notNull().default(0),
+    /** What the customer owes for the sale: subtotal minus discount. Tips come on top. */
+    total: bigint("total", { mode: "number" }).notNull(),
+    tipAmount: bigint("tip_amount", { mode: "number" }).notNull().default(0),
+    note: text("note"),
+    status: text("status", { enum: SALE_STATUSES }).notNull().default("paid"),
+    soldBy: text("sold_by").references(() => users.id, { onDelete: "set null" }),
+    voidedAt: instant("voided_at"),
+    createdAt: createdAt(),
+  },
+  (table) => [
+    uniqueIndex("sales_business_number_idx").on(table.businessId, table.number),
+    index("sales_business_created_idx").on(table.businessId, table.createdAt),
+    index("sales_customer_idx").on(table.customerId),
+  ],
+);
+
+/** The lines of a sale, with names and prices copied so history stays right. */
+export const saleItems = pgTable(
+  "sale_items",
+  {
+    id: id(),
+    saleId: text("sale_id")
+      .notNull()
+      .references(() => sales.id, { onDelete: "cascade" }),
+    kind: text("kind", { enum: SALE_ITEM_KINDS }).notNull(),
+    /** The appointment charged on this line, if any. */
+    appointmentId: text("appointment_id").references(() => appointments.id, {
+      onDelete: "set null",
+    }),
+    serviceId: text("service_id").references(() => services.id, { onDelete: "set null" }),
+    /** For a gift card sold: the card. */
+    giftCardId: text("gift_card_id").references((): AnyPgColumn => giftCards.id, {
+      onDelete: "set null",
+    }),
+    productId: text("product_id").references((): AnyPgColumn => products.id, {
+      onDelete: "set null",
+    }),
+    name: text("name").notNull(),
+    /** Who did it, for commissions. */
+    resourceId: text("resource_id").references(() => resources.id, { onDelete: "set null" }),
+    resourceName: text("resource_name"),
+    quantity: integer("quantity").notNull().default(1),
+    unitPrice: bigint("unit_price", { mode: "number" }).notNull(),
+    discountAmount: bigint("discount_amount", { mode: "number" }).notNull().default(0),
+    /** quantity × unit price − discount. */
+    total: bigint("total", { mode: "number" }).notNull(),
+    /** For products: their own commission and IVA when sold, so later changes don't rewrite it. */
+    commissionValue: doublePrecision("commission_value"),
+    commissionType: text("commission_type", { enum: COMMISSION_TYPES }),
+    taxRate: doublePrecision("tax_rate"),
+    position: integer("position").notNull().default(0),
+  },
+  (table) => [
+    index("sale_items_sale_idx").on(table.saleId),
+    index("sale_items_appointment_idx").on(table.appointmentId),
+  ],
+);
+
+/** Tips left with a sale, for each professional. */
+export const saleTips = pgTable(
+  "sale_tips",
+  {
+    id: id(),
+    saleId: text("sale_id")
+      .notNull()
+      .references(() => sales.id, { onDelete: "cascade" }),
+    resourceId: text("resource_id").references(() => resources.id, { onDelete: "set null" }),
+    resourceName: text("resource_name").notNull(),
+    amount: bigint("amount", { mode: "number" }).notNull(),
+  },
+  (table) => [index("sale_tips_sale_idx").on(table.saleId)],
+);
+
+/** How a sale was paid: one row per method, adding up to its total plus tips. */
+export const salePayments = pgTable(
+  "sale_payments",
+  {
+    id: id(),
+    saleId: text("sale_id")
+      .notNull()
+      .references(() => sales.id, { onDelete: "cascade" }),
+    method: text("method", { enum: SALE_PAYMENT_METHODS }).notNull(),
+    amount: bigint("amount", { mode: "number" }).notNull(),
+    /** For "deposit": the deposit used. */
+    depositId: text("deposit_id").references((): AnyPgColumn => deposits.id, {
+      onDelete: "set null",
+    }),
+    /** For "gift_card": the card whose balance paid. */
+    giftCardId: text("gift_card_id").references((): AnyPgColumn => giftCards.id, {
+      onDelete: "set null",
+    }),
+  },
+  (table) => [index("sale_payments_sale_idx").on(table.saleId)],
+);
+
+// ---------------------------------------------------------------------------
+// Products and stock
+// ---------------------------------------------------------------------------
+
+/**
+ * The business's own lists of categories and brands, so products are filed the same way
+ * every time. `key` is what tells entries apart
+ * (see core's attributeKey): "Coca-Cola" and "coca cola" can't both exist.
+ */
+export const productAttributes = pgTable(
+  "product_attributes",
+  {
+    id: id(),
+    businessId: text("business_id")
+      .notNull()
+      .references(() => businesses.id, { onDelete: "cascade" }),
+    kind: text("kind", { enum: PRODUCT_ATTRIBUTE_KINDS }).notNull(),
+    name: text("name").notNull(),
+    key: text("key").notNull(),
+    createdAt: createdAt(),
+  },
+  (table) => [
+    uniqueIndex("product_attributes_business_kind_key_idx").on(
+      table.businessId,
+      table.kind,
+      table.key,
+    ),
+  ],
+);
+
+/** What the business sells or uses: shampoo, wax, a gift box… */
+export const products = pgTable(
+  "products",
+  {
+    id: id(),
+    businessId: text("business_id")
+      .notNull()
+      .references(() => businesses.id, { onDelete: "cascade" }),
+    name: text("name").notNull(),
+    sku: text("sku"),
+    categoryId: text("category_id").references(() => productAttributes.id),
+    brandId: text("brand_id").references(() => productAttributes.id),
+    /** How much it holds, in `unit`: 400 (ml). Both or neither. */
+    content: doublePrecision("content"),
+    unit: text("unit", { enum: PRODUCT_UNITS }),
+    description: text("description"),
+    priceAmount: bigint("price_amount", { mode: "number" }).notNull(),
+    /** What the team pays for it (internal sales); null: the sale price. */
+    internalPriceAmount: bigint("internal_price_amount", { mode: "number" }),
+    costAmount: bigint("cost_amount", { mode: "number" }),
+    /** Paid to whoever sells it instead of their usual product commission; null: theirs. */
+    commissionValue: doublePrecision("commission_value"),
+    commissionType: text("commission_type", { enum: COMMISSION_TYPES })
+      .notNull()
+      .default("percent"),
+    /** The price includes this IVA, in percent; null when it doesn't say. */
+    taxRate: doublePrecision("tax_rate"),
+    forSale: boolean("for_sale").notNull().default(true),
+    active: boolean("active").notNull().default(true),
+    createdAt: createdAt(),
+    updatedAt: updatedAt(),
+  },
+  (table) => [index("products_business_id_idx").on(table.businessId)],
+);
+
+/** Units of each product at each location, kept in step with the movements. */
+export const productStock = pgTable(
+  "product_stock",
+  {
+    productId: text("product_id")
+      .notNull()
+      .references(() => products.id, { onDelete: "cascade" }),
+    locationId: text("location_id")
+      .notNull()
+      .references(() => locations.id, { onDelete: "cascade" }),
+    /** May go below zero when something sells before it's entered. */
+    quantity: integer("quantity").notNull().default(0),
+    /** A warning shows when `quantity` goes down to this; null: no warning here. */
+    alertAt: integer("alert_at"),
+  },
+  (table) => [primaryKey({ columns: [table.productId, table.locationId] })],
+);
+
+/** Every change in stock, with what it left: the inventory's history. */
+export const stockMovements = pgTable(
+  "stock_movements",
+  {
+    id: id(),
+    businessId: text("business_id")
+      .notNull()
+      .references(() => businesses.id, { onDelete: "cascade" }),
+    productId: text("product_id")
+      .notNull()
+      .references(() => products.id, { onDelete: "cascade" }),
+    locationId: text("location_id")
+      .notNull()
+      .references(() => locations.id, { onDelete: "cascade" }),
+    kind: text("kind", { enum: STOCK_MOVEMENT_KINDS }).notNull(),
+    /** Units in (+) or out (−). */
+    quantity: integer("quantity").notNull(),
+    /** Stock at the location right after it. */
+    balanceAfter: integer("balance_after").notNull(),
+    unitCost: bigint("unit_cost", { mode: "number" }),
+    /** The sale that sold (or gave back) it. */
+    saleId: text("sale_id").references(() => sales.id, { onDelete: "set null" }),
+    /** Both halves of a transfer share it. */
+    transferId: text("transfer_id"),
+    note: text("note"),
+    createdBy: text("created_by").references(() => users.id, { onDelete: "set null" }),
+    createdAt: createdAt(),
+  },
+  (table) => [
+    index("stock_movements_business_created_idx").on(table.businessId, table.createdAt),
+    index("stock_movements_product_idx").on(table.productId, table.createdAt),
+  ],
+);
+
+/**
+ * Discount codes and gift cards with a balance. Uses and balance aren't stored: they come
+ * from the appointments and sales that used the card, so voiding or cancelling gives them
+ * back on its own.
+ */
+export const giftCards = pgTable(
+  "gift_cards",
+  {
+    id: id(),
+    businessId: text("business_id")
+      .notNull()
+      .references(() => businesses.id, { onDelete: "cascade" }),
+    /** What people type, upper case; unique within the business. */
+    code: text("code").notNull(),
+    kind: text("kind", { enum: GIFT_CARD_KINDS }).notNull(),
+    /** Discount codes: a percentage off… */
+    percent: integer("percent"),
+    /** …or a fixed amount off. Gift cards: the money on the card. */
+    amount: bigint("amount", { mode: "number" }),
+    maxUses: integer("max_uses"),
+    validFrom: date("valid_from", { mode: "string" }),
+    validUntil: date("valid_until", { mode: "string" }),
+    /** Who it was sold or given to. */
+    customerId: text("customer_id").references(() => customers.id, { onDelete: "set null" }),
+    note: text("note"),
+    active: boolean("active").notNull().default(true),
+    createdBy: text("created_by").references(() => users.id, { onDelete: "set null" }),
+    createdAt: createdAt(),
+    updatedAt: updatedAt(),
+  },
+  (table) => [uniqueIndex("gift_cards_business_code_idx").on(table.businessId, table.code)],
+);
+
+/**
+ * Money in or out of a location outside of sales: other income, expenses, cash taken out
+ * of the drawer and corrections after counting it.
+ */
+export const cashMovements = pgTable(
+  "cash_movements",
+  {
+    id: id(),
+    businessId: text("business_id")
+      .notNull()
+      .references(() => businesses.id, { onDelete: "cascade" }),
+    locationId: text("location_id")
+      .notNull()
+      .references(() => locations.id, { onDelete: "cascade" }),
+    kind: text("kind", { enum: CASH_MOVEMENT_KINDS }).notNull(),
+    /** Positive; for an adjustment, what it adds to (+) or takes from (−) the cash. */
+    amount: bigint("amount", { mode: "number" }).notNull(),
+    /** Income and expenses: how they were paid. Transfers and adjustments are cash. */
+    method: text("method", { enum: PAYMENT_METHODS }).notNull().default("cash"),
+    category: text("category"),
+    description: text("description"),
+    /** Both halves of a transfer between locations share it. */
+    transferId: text("transfer_id"),
+    createdBy: text("created_by").references(() => users.id, { onDelete: "set null" }),
+    createdAt: createdAt(),
+  },
+  (table) => [index("cash_movements_business_created_idx").on(table.businessId, table.createdAt)],
+);
+
+export const DEPOSIT_STATUSES = ["active", "void"] as const;
+
+/**
+ * Money a customer leaves in advance ("abonos"), usually for an appointment. It counts as
+ * cash flow when received and is used up as a payment when the appointment is charged.
+ */
+export const deposits = pgTable(
+  "deposits",
+  {
+    id: id(),
+    businessId: text("business_id")
+      .notNull()
+      .references(() => businesses.id, { onDelete: "cascade" }),
+    locationId: text("location_id").references(() => locations.id, { onDelete: "set null" }),
+    customerId: text("customer_id")
+      .notNull()
+      .references(() => customers.id, { onDelete: "cascade" }),
+    appointmentId: text("appointment_id").references(() => appointments.id, {
+      onDelete: "set null",
+    }),
+    amount: bigint("amount", { mode: "number" }).notNull(),
+    method: text("method", { enum: PAYMENT_METHODS }).notNull(),
+    note: text("note"),
+    status: text("status", { enum: DEPOSIT_STATUSES }).notNull().default("active"),
+    /** The sale it paid for, once used. */
+    appliedSaleId: text("applied_sale_id").references(() => sales.id, { onDelete: "set null" }),
+    createdBy: text("created_by").references(() => users.id, { onDelete: "set null" }),
+    voidedAt: instant("voided_at"),
+    createdAt: createdAt(),
+  },
+  (table) => [
+    index("deposits_business_created_idx").on(table.businessId, table.createdAt),
+    index("deposits_customer_idx").on(table.customerId),
+    index("deposits_appointment_idx").on(table.appointmentId),
   ],
 );
 
@@ -525,11 +987,16 @@ export const automationDeliveries = pgTable(
 
 export type User = typeof users.$inferSelect;
 export type Business = typeof businesses.$inferSelect;
+export type Location = typeof locations.$inferSelect;
 export type Invitation = typeof invitations.$inferSelect;
 export type Service = typeof services.$inferSelect;
 export type Resource = typeof resources.$inferSelect;
 export type Customer = typeof customers.$inferSelect;
 export type Appointment = typeof appointments.$inferSelect;
 export type ApiKey = typeof apiKeys.$inferSelect;
+export type Sale = typeof sales.$inferSelect;
+export type Deposit = typeof deposits.$inferSelect;
+export type GiftCard = typeof giftCards.$inferSelect;
+export type Product = typeof products.$inferSelect;
 export type Automation = typeof automations.$inferSelect;
 export type AutomationDelivery = typeof automationDeliveries.$inferSelect;

@@ -106,6 +106,104 @@
       "when": 1792644512537,
       "tag": "0014_user_tours",
       "breakpoints": true
+    },
+    {
+      "idx": 15,
+      "version": "7",
+      "when": 1793312727666,
+      "tag": "0015_locations",
+      "breakpoints": true
+    },
+    {
+      "idx": 16,
+      "version": "7",
+      "when": 1793314040344,
+      "tag": "0016_sales",
+      "breakpoints": true
+    },
+    {
+      "idx": 17,
+      "version": "7",
+      "when": 1793314835068,
+      "tag": "0017_gift_cards",
+      "breakpoints": true
+    },
+    {
+      "idx": 18,
+      "version": "7",
+      "when": 1793315397026,
+      "tag": "0018_inventory",
+      "breakpoints": true
+    },
+    {
+      "idx": 19,
+      "version": "7",
+      "when": 1793315859659,
+      "tag": "0019_cash",
+      "breakpoints": true
+    },
+    {
+      "idx": 20,
+      "version": "7",
+      "when": 1793316191220,
+      "tag": "0020_commissions",
+      "breakpoints": true
+    },
+    {
+      "idx": 21,
+      "version": "7",
+      "when": 1793334987924,
+      "tag": "0021_short_ids",
+      "breakpoints": true
+    },
+    {
+      "idx": 22,
+      "version": "7",
+      "when": 1793336127437,
+      "tag": "0022_product_catalog",
+      "breakpoints": true
+    },
+    {
+      "idx": 23,
+      "version": "7",
+      "when": 1793336163218,
+      "tag": "0023_product_catalog_cleanup",
+      "breakpoints": true
+    },
+    {
+      "idx": 24,
+      "version": "7",
+      "when": 1793389885830,
+      "tag": "0024_product_formats_as_text",
+      "breakpoints": true
+    },
+    {
+      "idx": 25,
+      "version": "7",
+      "when": 1793395207265,
+      "tag": "0025_product_content",
+      "breakpoints": true
+    },
+    {
+      "idx": 26,
+      "version": "7",
+      "when": 1793395233503,
+      "tag": "0026_drop_product_formats",
+      "breakpoints": true
+    },
+    {
+      "idx": 27,
+      "version": "7",
+      "when": 1793676268045,
+      "tag": "0027_professional_photos_service_categories",
+      "breakpoints": true
+    },
+    {
+      "idx": 28,
+      "version": "7",
+      "when": 1793677226393,
+      "tag": "0028_customer_details",
+      "breakpoints": true
     }
   ]
 }

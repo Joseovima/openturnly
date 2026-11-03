@@ -21,7 +21,7 @@ import { type Cell, downloadCsv, downloadXlsx } from "../../lib/export.ts";
 import { errorMessage } from "../../lib/forms.ts";
 import { useBusinessContext } from "./business.tsx";
 
-type Status = "all" | "confirmed" | "cancelled";
+type Status = "all" | "confirmed" | "no_show" | "cancelled";
 
 /** "Página de reservas", "Panel" or "Agente IA · WhatsApp": where an appointment came from. */
 export function bookedVia(
@@ -43,10 +43,15 @@ export function bookedVia(
 export function AppointmentsList({
   period,
   resourceFilter,
+  locationFilter,
+  showLocation,
   onOpen,
 }: {
   period: Period;
   resourceFilter: string;
+  locationFilter: string;
+  /** The business has several locations: say where each appointment is. */
+  showLocation: boolean;
   onOpen: (appointment: Appointment) => void;
 }) {
   const { t, i18n } = useTranslation();
@@ -70,6 +75,7 @@ export function AppointmentsList({
     const needle = searchable(query.trim());
     return (appointments.data ?? []).filter((appointment) => {
       if (resourceFilter && appointment.resourceId !== resourceFilter) return false;
+      if (locationFilter && appointment.locationId !== locationFilter) return false;
       if (status !== "all" && appointment.status !== status) return false;
       if (!needle) return true;
       const { customer } = appointment;
@@ -77,7 +83,7 @@ export function AppointmentsList({
         `${customer.firstName} ${customer.lastName} ${customer.phone ?? ""} ${customer.email ?? ""} ${appointment.code} ${appointment.serviceName} ${appointment.resourceName ?? ""}`,
       ).includes(needle);
     });
-  }, [appointments.data, resourceFilter, status, query]);
+  }, [appointments.data, resourceFilter, locationFilter, status, query]);
 
   const confirmed = rows.filter((appointment) => appointment.status === "confirmed");
   const total = confirmed.reduce((sum, appointment) => sum + (appointment.priceAmount ?? 0), 0);
@@ -100,7 +106,7 @@ export function AppointmentsList({
         const start = zoned(appointment.startsAt);
         const end = zoned(appointment.endsAt);
         return (
-          <div className={cn(appointment.status === "cancelled" && "opacity-60")}>
+          <div className={cn(appointment.status !== "confirmed" && "opacity-60")}>
             <div className="font-medium text-zinc-900 first-letter:uppercase">
               {day.format(new Date(`${start.date}T12:00:00Z`))}
             </div>
@@ -134,7 +140,9 @@ export function AppointmentsList({
         <div className="min-w-0">
           <div className="truncate text-zinc-900">{appointment.serviceName}</div>
           <div className="truncate text-[13px] text-zinc-500">
-            {appointment.resourceName ?? "—"}
+            {[appointment.resourceName, showLocation ? appointment.locationName : null]
+              .filter(Boolean)
+              .join(" · ") || "—"}
           </div>
         </div>
       ),
@@ -157,6 +165,8 @@ export function AppointmentsList({
       cell: (appointment) =>
         appointment.status === "cancelled" ? (
           <Badge tone="danger">{t("agenda.statusCancelled")}</Badge>
+        ) : appointment.status === "no_show" ? (
+          <Badge tone="warning">{t("agenda.statusNoShow")}</Badge>
         ) : Date.parse(appointment.startsAt) > now ? (
           <Badge tone="brand">{t("agenda.statusUpcoming")}</Badge>
         ) : (
@@ -192,6 +202,7 @@ export function AppointmentsList({
       t("agenda.exportStart"),
       t("agenda.exportEnd"),
       t("agenda.exportDuration"),
+      ...(showLocation ? [t("booking.location")] : []),
       t("booking.service"),
       t("booking.professional"),
       `${t("booking.price")} (${business.currency})`,
@@ -212,11 +223,14 @@ export function AppointmentsList({
         appointment.code,
         appointment.status === "cancelled"
           ? t("agenda.statusCancelled")
-          : t("agenda.statusConfirmed"),
+          : appointment.status === "no_show"
+            ? t("agenda.statusNoShow")
+            : t("agenda.statusConfirmed"),
         start.date,
         start.time,
         end.time,
         Math.round((Date.parse(appointment.endsAt) - Date.parse(appointment.startsAt)) / 60_000),
+        ...(showLocation ? [appointment.locationName] : []),
         appointment.serviceName,
         appointment.resourceName,
         appointment.priceAmount === null
@@ -273,7 +287,7 @@ export function AppointmentsList({
                 />
               </div>
               <div className="inline-flex rounded-md bg-zinc-100 p-0.5">
-                {(["all", "confirmed", "cancelled"] as const).map((option) => (
+                {(["all", "confirmed", "no_show", "cancelled"] as const).map((option) => (
                   <button
                     key={option}
                     type="button"
@@ -312,7 +326,7 @@ export function AppointmentsList({
   );
 }
 
-function ExportMenu({
+export function ExportMenu({
   disabled,
   onExcel,
   onCsv,

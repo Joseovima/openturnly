@@ -6,27 +6,41 @@ import {
   staffBookingSchema,
   zonedTimeToInstant,
 } from "@openturnly/core";
-import { and, asc, eq, gt, lt, ne, sql } from "drizzle-orm";
+import { and, asc, eq, gt, inArray, isNull, lt, ne, sql } from "drizzle-orm";
 import { Hono } from "hono";
 import { z } from "zod";
-import { appointments, type Business, customers, resources, services } from "../db/schema.ts";
+import {
+  appointments,
+  type Business,
+  customers,
+  deposits,
+  giftCards,
+  locations,
+  resources,
+  services,
+} from "../db/schema.ts";
 import type { BusinessAccess } from "../lib/access.ts";
-import { moveAppointment, staffRules } from "../lib/appointment-changes.ts";
+import { closedError, moveAppointment, staffRules } from "../lib/appointment-changes.ts";
 import { newBookingCode } from "../lib/codes.ts";
 import { matchCustomer, saveBookingCustomer } from "../lib/customers.ts";
 import { apiError, type BusinessEnv, type Deps, parseBody } from "../lib/http.ts";
+import { resolveLocation } from "../lib/locations.ts";
+import { chargedAppointments } from "../lib/sales.ts";
 import { loadSchedules, pickLeastBusy } from "../lib/schedules.ts";
 
 const rangeQuery = z.object({
   from: z.iso.datetime({ offset: true }),
   to: z.iso.datetime({ offset: true }),
   includeCancelled: z.enum(["true", "false"]).optional(),
+  locationId: z.string().min(1).optional(),
 });
 
 /** Longest period one request can cover: enough for a yearly export. */
 const MAX_RANGE_MS = 400 * 24 * 60 * 60 * 1000;
 
 const rescheduleSchema = z.object({
+  /** Another location; left out, the appointment stays where it is. */
+  locationId: z.string().min(1).optional(),
   serviceId: z.string().min(1),
   /** A professional, or null for whoever is free. */
   resourceId: z.string().min(1).nullable(),
@@ -36,12 +50,8 @@ const rescheduleSchema = z.object({
 
 /** The business calendar: appointments between two instants, with who booked them. */
 export function appointmentRoutes({ db, automations }: Deps) {
-  /** A confirmed appointment of the business; professionals only reach their own. */
-  const findAppointment = async (
-    businessId: string,
-    appointmentId: string,
-    access: BusinessAccess,
-  ) => {
+  /** An appointment of the business, whatever its status; professionals only reach their own. */
+  const findAny = async (businessId: string, appointmentId: string, access: BusinessAccess) => {
     const [appointment] = await db
       .select()
       .from(appointments)
@@ -50,7 +60,17 @@ export function appointmentRoutes({ db, automations }: Deps) {
     if (access.role === "professional" && appointment.resourceId !== access.resourceId) {
       throw apiError(404, "appointment_not_found");
     }
-    if (appointment.status !== "confirmed") throw apiError(409, "appointment_cancelled");
+    return appointment;
+  };
+
+  /** A confirmed appointment of the business; professionals only reach their own. */
+  const findAppointment = async (
+    businessId: string,
+    appointmentId: string,
+    access: BusinessAccess,
+  ) => {
+    const appointment = await findAny(businessId, appointmentId, access);
+    if (appointment.status !== "confirmed") throw closedError(appointment);
     return appointment;
   };
 
@@ -70,15 +90,18 @@ export function appointmentRoutes({ db, automations }: Deps) {
   const freeSlots = async (
     business: Business,
     access: BusinessAccess,
+    locationId: string | null | undefined,
     serviceId: string,
     date: string,
     ignoreAppointmentId?: string,
   ) => {
     if (!isDateString(date)) throw apiError(400, "invalid_date");
+    const location = await resolveLocation(db, business.id, locationId, { forBooking: true });
     const service = await findService(business.id, serviceId);
     const schedules = await loadSchedules(
       db,
       business,
+      location.id,
       service.id,
       null,
       date,
@@ -122,11 +145,15 @@ export function appointmentRoutes({ db, automations }: Deps) {
             startsAt: appointments.startsAt,
             endsAt: appointments.endsAt,
             status: appointments.status,
+            locationId: appointments.locationId,
+            locationName: locations.name,
             serviceId: appointments.serviceId,
             serviceName: appointments.serviceName,
             resourceId: appointments.resourceId,
             resourceName: appointments.resourceName,
             priceAmount: appointments.priceAmount,
+            discountAmount: appointments.discountAmount,
+            giftCode: giftCards.code,
             answers: appointments.answers,
             source: appointments.source,
             sourceLabel: appointments.sourceLabel,
@@ -134,6 +161,7 @@ export function appointmentRoutes({ db, automations }: Deps) {
             cancelledAt: appointments.cancelledAt,
             customer: {
               id: customers.id,
+              shortId: customers.shortId,
               firstName: customers.firstName,
               lastName: customers.lastName,
               email: customers.email,
@@ -142,9 +170,14 @@ export function appointmentRoutes({ db, automations }: Deps) {
           })
           .from(appointments)
           .innerJoin(customers, eq(customers.id, appointments.customerId))
+          .leftJoin(locations, eq(locations.id, appointments.locationId))
+          .leftJoin(giftCards, eq(giftCards.id, appointments.giftCardId))
           .where(
             and(
               eq(appointments.businessId, c.get("business").id),
+              query.data.locationId
+                ? eq(appointments.locationId, query.data.locationId)
+                : undefined,
               lt(appointments.startsAt, to),
               gt(appointments.endsAt, from),
               query.data.includeCancelled === "true"
@@ -157,13 +190,43 @@ export function appointmentRoutes({ db, automations }: Deps) {
             ),
           )
           .orderBy(asc(appointments.startsAt));
-        return c.json({ appointments: rows });
+        // Whether each one was charged, and the deposits waiting to pay for it.
+        const ids = rows.map((row) => row.id);
+        const charged = await chargedAppointments(db, ids);
+        const waiting =
+          ids.length > 0 && access.role !== "professional"
+            ? await db
+                .select({ appointmentId: deposits.appointmentId, amount: deposits.amount })
+                .from(deposits)
+                .where(
+                  and(
+                    inArray(deposits.appointmentId, ids),
+                    eq(deposits.status, "active"),
+                    isNull(deposits.appliedSaleId),
+                  ),
+                )
+            : [];
+        return c.json({
+          appointments: rows.map((row) => ({
+            ...row,
+            sale: charged.get(row.id) ?? null,
+            depositAmount: waiting
+              .filter((deposit) => deposit.appointmentId === row.id)
+              .reduce((sum, deposit) => sum + deposit.amount, 0),
+          })),
+        });
       })
 
       /** Times a new appointment could take on `date`, and who is free at each. */
       .get("/slots", async (c) => {
-        const { serviceId = "", date = "" } = c.req.query();
-        const slots = await freeSlots(c.get("business"), c.get("access"), serviceId, date);
+        const { serviceId = "", date = "", locationId } = c.req.query();
+        const slots = await freeSlots(
+          c.get("business"),
+          c.get("access"),
+          locationId,
+          serviceId,
+          date,
+        );
         return c.json({ slots });
       })
 
@@ -176,8 +239,15 @@ export function appointmentRoutes({ db, automations }: Deps) {
           c.req.param("appointmentId"),
           access,
         );
-        const { serviceId = "", date = "" } = c.req.query();
-        const slots = await freeSlots(business, access, serviceId, date, appointment.id);
+        const { serviceId = "", date = "", locationId } = c.req.query();
+        const slots = await freeSlots(
+          business,
+          access,
+          locationId || appointment.locationId,
+          serviceId,
+          date,
+          appointment.id,
+        );
         return c.json({ slots });
       })
 
@@ -187,6 +257,9 @@ export function appointmentRoutes({ db, automations }: Deps) {
         const access = c.get("access");
         const input = await parseBody(c, staffBookingSchema);
         const resourceId = bookedFor(access, input.resourceId);
+        const location = await resolveLocation(db, business.id, input.locationId, {
+          forBooking: true,
+        });
         const service = await findService(business.id, input.serviceId);
         const startsAt = zonedTimeToInstant(input.date, parseTime(input.time), business.timezone);
         const endsAt = startsAt + service.durationMin * 60_000;
@@ -233,6 +306,7 @@ export function appointmentRoutes({ db, automations }: Deps) {
           const schedules = await loadSchedules(
             tx,
             business,
+            location.id,
             service.id,
             resourceId,
             input.date,
@@ -258,6 +332,7 @@ export function appointmentRoutes({ db, automations }: Deps) {
             .values({
               code: await newBookingCode(tx),
               businessId: business.id,
+              locationId: location.id,
               serviceId: service.id,
               resourceId: assigned,
               customerId,
@@ -284,7 +359,17 @@ export function appointmentRoutes({ db, automations }: Deps) {
         const current = await findAppointment(business.id, c.req.param("appointmentId"), access);
         const parsed = await parseBody(c, rescheduleSchema);
         // Professionals move their own appointments, but can't hand them to someone else.
-        const input = { ...parsed, resourceId: bookedFor(access, parsed.resourceId) };
+        const location = await resolveLocation(
+          db,
+          business.id,
+          parsed.locationId ?? current.locationId,
+          { forBooking: false },
+        );
+        const input = {
+          ...parsed,
+          locationId: location.id,
+          resourceId: bookedFor(access, parsed.resourceId),
+        };
         const service = await findService(business.id, input.serviceId);
         const appointment = await moveAppointment(
           db,
@@ -296,6 +381,77 @@ export function appointmentRoutes({ db, automations }: Deps) {
         );
         await automations.emit(appointment.id, "rescheduled", current.startsAt);
         return c.json({ appointment });
+      })
+
+      /**
+       * The customer didn't come. Only once the appointment has started and while it isn't
+       * charged; the time it had is free again.
+       */
+      .post("/:appointmentId/no-show", async (c) => {
+        const businessId = c.get("business").id;
+        const appointment = await findAppointment(
+          businessId,
+          c.req.param("appointmentId"),
+          c.get("access"),
+        );
+        if (appointment.startsAt.getTime() > Date.now()) {
+          throw apiError(409, "appointment_not_started");
+        }
+        if ((await chargedAppointments(db, [appointment.id])).size > 0) {
+          throw apiError(409, "appointment_paid");
+        }
+        const [marked] = await db
+          .update(appointments)
+          .set({ status: "no_show" })
+          .where(and(eq(appointments.id, appointment.id), eq(appointments.status, "confirmed")))
+          .returning({ id: appointments.id, status: appointments.status });
+        if (marked) await automations.emit(marked.id, "no_show");
+        return c.json({ appointment: marked ?? { id: appointment.id, status: "no_show" } });
+      })
+
+      /** Undoes a no-show: they did come after all, if nobody took the time meanwhile. */
+      .delete("/:appointmentId/no-show", async (c) => {
+        const businessId = c.get("business").id;
+        const appointment = await findAny(
+          businessId,
+          c.req.param("appointmentId"),
+          c.get("access"),
+        );
+        if (appointment.status === "confirmed") {
+          return c.json({ appointment: { id: appointment.id, status: appointment.status } });
+        }
+        if (appointment.status !== "no_show") throw closedError(appointment);
+        const restored = await db.transaction(async (tx) => {
+          await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${businessId}, 0))`);
+          const [clash] = await tx
+            .select({ id: appointments.id })
+            .from(appointments)
+            .where(
+              and(
+                eq(appointments.businessId, businessId),
+                eq(appointments.status, "confirmed"),
+                appointment.resourceId
+                  ? eq(appointments.resourceId, appointment.resourceId)
+                  : and(
+                      isNull(appointments.resourceId),
+                      appointment.locationId
+                        ? eq(appointments.locationId, appointment.locationId)
+                        : undefined,
+                    ),
+                lt(appointments.startsAt, appointment.endsAt),
+                gt(appointments.endsAt, appointment.startsAt),
+              ),
+            )
+            .limit(1);
+          if (clash) throw apiError(409, "slot_taken");
+          const [updated] = await tx
+            .update(appointments)
+            .set({ status: "confirmed" })
+            .where(and(eq(appointments.id, appointment.id), eq(appointments.status, "no_show")))
+            .returning({ id: appointments.id, status: appointments.status });
+          return updated;
+        });
+        return c.json({ appointment: restored ?? { id: appointment.id, status: "confirmed" } });
       })
 
       .post("/:appointmentId/cancel", async (c) => {

@@ -16,12 +16,14 @@ import {
   businessMembers,
   holidayOverrides,
   invitations,
+  locations,
   resources,
   users,
   weeklyHours,
 } from "../db/schema.ts";
 import { type BusinessAccess, findBusinessWithAccess, findManagedBusiness } from "../lib/access.ts";
 import { createAccount, resetPassword } from "../lib/accounts.ts";
+import { newBusinessShortId } from "../lib/codes.ts";
 import { businessCountry } from "../lib/holidays.ts";
 import {
   type AppEnv,
@@ -32,15 +34,10 @@ import {
   requireUser,
 } from "../lib/http.ts";
 import { logoUrls } from "../lib/images.ts";
+import { DEFAULT_HOURS } from "../lib/locations.ts";
 import { createToken, hashToken } from "../lib/tokens.ts";
 
 const INVITATION_TTL_MS = 7 * 24 * 60 * 60 * 1000;
-
-/** New businesses start open Monday to Friday 9–18 and Saturday 9–13; easy to change. */
-const DEFAULT_HOURS = [
-  ...[1, 2, 3, 4, 5].map((weekday) => ({ weekday, start: "09:00", end: "18:00" })),
-  { weekday: 6, start: "09:00", end: "13:00" },
-];
 
 /** The business as the admin sees it: its country, its logo and the user's access to it. */
 function adminView(business: Business, logoUrl: string | null, access?: BusinessAccess) {
@@ -98,11 +95,24 @@ export function businessRoutes({ db, config, auth, guard }: Deps) {
         const input: BusinessCreateInput = await parseBody(c, businessCreateSchema);
         await assertSlugAvailable(db, input.slug);
         const business = await db.transaction(async (tx) => {
-          const [created] = await tx.insert(businesses).values(input).returning();
+          const [created] = await tx
+            .insert(businesses)
+            .values({ ...input, shortId: await newBusinessShortId(tx) })
+            .returning();
           if (!created) throw apiError(500, "internal_error");
-          await tx
-            .insert(weeklyHours)
-            .values(DEFAULT_HOURS.map((range) => ({ ...range, businessId: created.id })));
+          // Every business works from at least one location, named after it to begin with.
+          const [location] = await tx
+            .insert(locations)
+            .values({ businessId: created.id, name: created.name })
+            .returning();
+          if (!location) throw apiError(500, "internal_error");
+          await tx.insert(weeklyHours).values(
+            DEFAULT_HOURS.map((range) => ({
+              ...range,
+              businessId: created.id,
+              locationId: location.id,
+            })),
+          );
           return created;
         });
         return c.json(

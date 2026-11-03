@@ -5,6 +5,7 @@ import {
   bookingDetailsSchema,
   formatPhone,
   formatPrice,
+  GENDERS,
   instantToZoned,
   todayIn,
 } from "@openturnly/core";
@@ -16,14 +17,18 @@ import {
   ChevronLeft,
   Clock,
   LoaderCircle,
+  MapPin,
   RotateCcw,
+  Search,
+  Users,
 } from "lucide-react";
 import { type FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { useParams } from "react-router";
+import { useParams, useSearchParams } from "react-router";
+import { Avatar } from "../components/avatar.tsx";
+import { BirthDateField } from "../components/birth-date-field.tsx";
 import { BookingBackdrop, isDarkTheme } from "../components/booking-backdrop.tsx";
 import { BookingHeader } from "../components/booking-header.tsx";
-import { Combobox } from "../components/combobox.tsx";
 import { MonthCalendar } from "../components/month-calendar.tsx";
 import { PhoneInput } from "../components/phone-input.tsx";
 import { Alert, Button, Field, Input, Select, Spinner, Textarea } from "../components/ui.tsx";
@@ -33,14 +38,14 @@ import {
   type PublicBusiness,
   type PublicCatalog,
 } from "../lib/api.ts";
-import { useAvailability, useBook, usePublicCatalog } from "../lib/booking.ts";
+import { useAvailability, useBook, useGiftCodeCheck, usePublicCatalog } from "../lib/booking.ts";
 import { brandStyle } from "../lib/brand.ts";
 import { cn } from "../lib/cn.ts";
 import { formatDay, formatDuration } from "../lib/format.ts";
 import { type FieldErrors, fieldMessage, validate } from "../lib/forms.ts";
 import { useBookingProof } from "../lib/proof.ts";
 
-type Step = "service" | "datetime" | "details" | "confirm";
+type Step = "location" | "service" | "datetime" | "details" | "confirm";
 type T = TFunction;
 
 /** The page a business shares with its customers: /<slug>. */
@@ -86,9 +91,35 @@ export function PublicBookingPage() {
 }
 
 /** What the customer is typing; checked and cleaned with `bookingDetailsSchema`. */
-type DraftCustomer = { firstName: string; lastName: string; phone: string; email: string };
+type DraftCustomer = {
+  firstName: string;
+  lastName: string;
+  phone: string;
+  email: string;
+  birthDate: string;
+  document: string;
+  gender: string;
+};
 
-const EMPTY_CUSTOMER: DraftCustomer = { email: "", phone: "", firstName: "", lastName: "" };
+const EMPTY_CUSTOMER: DraftCustomer = {
+  email: "",
+  phone: "",
+  firstName: "",
+  lastName: "",
+  birthDate: "",
+  document: "",
+  gender: "",
+};
+
+/** "14 de mayo de 1990". */
+function formatBirthDate(date: string, locale: string) {
+  return new Intl.DateTimeFormat(locale, {
+    day: "numeric",
+    month: "long",
+    year: "numeric",
+    timeZone: "UTC",
+  }).format(Date.parse(`${date}T00:00:00Z`));
+}
 
 /**
  * The customer's details are remembered on their own device after a booking, so the next
@@ -103,11 +134,15 @@ function readSavedCustomer(slug: string): DraftCustomer | null {
   try {
     const saved = JSON.parse(localStorage.getItem(savedCustomerKey(slug)) ?? "null");
     if (typeof saved?.firstName !== "string" || typeof saved?.lastName !== "string") return null;
+    const text = (value: unknown) => (typeof value === "string" ? value : "");
     return {
       firstName: saved.firstName,
       lastName: saved.lastName,
-      phone: typeof saved.phone === "string" ? saved.phone : "",
-      email: typeof saved.email === "string" ? saved.email : "",
+      phone: text(saved.phone),
+      email: text(saved.email),
+      birthDate: text(saved.birthDate),
+      document: text(saved.document),
+      gender: text(saved.gender),
     };
   } catch {
     return null;
@@ -134,12 +169,30 @@ function BookingWizard({
   t: T;
   locale: string;
 }) {
-  const { business, professionals, services } = catalog;
-  // The time comes before the person: customers see who is free when, instead of picking
-  // someone first and finding them fully booked.
-  const steps: Step[] = ["service", "datetime", "details", "confirm"];
+  const { business, professionals, locations } = catalog;
+  // With several locations the customer starts by choosing where. A link to one location
+  // (?local=<id>) starts on its services. The time comes before the person: customers see
+  // who is free when, instead of picking someone first and finding them fully booked.
+  const severalLocations = locations.length > 1;
+  const steps: Step[] = [
+    ...(severalLocations ? (["location"] as const) : []),
+    "service",
+    "datetime",
+    "details",
+    "confirm",
+  ];
+  const [searchParams] = useSearchParams();
+  const linked = locations.find((place) => place.id === searchParams.get("local"));
 
-  const [stepIndex, setStepIndex] = useState(0);
+  const [stepIndex, setStepIndex] = useState(severalLocations && linked ? 1 : 0);
+  const [locationId, setLocationId] = useState<string | null>(
+    linked?.id ?? (severalLocations ? null : (locations[0]?.id ?? null)),
+  );
+  const location = locations.find((place) => place.id === locationId);
+  // What the chosen location offers.
+  const services = location
+    ? catalog.services.filter((service) => location.serviceIds.includes(service.id))
+    : catalog.services;
   const [serviceId, setServiceId] = useState<string | null>(null);
   // Someone the customer wants to see (narrows the times), or null for anyone.
   const [preferredId, setPreferredId] = useState<string | null>(null);
@@ -158,8 +211,10 @@ function BookingWizard({
   const [errors, setErrors] = useState<FieldErrors>({});
   const [notice, setNotice] = useState<string | null>(null);
   const [booked, setBooked] = useState<BookedAppointment | null>(null);
+  // A discount code that worked for the chosen service.
+  const [gift, setGift] = useState<{ code: string; discountAmount: number } | null>(null);
   // The anti-bot puzzle is solved in the background from the moment a time is being chosen.
-  const takeProof = useBookingProof(slug, stepIndex >= 1);
+  const takeProof = useBookingProof(slug, stepIndex >= steps.indexOf("datetime"));
   const book = useBook(slug, takeProof);
   // Usually instant; while a business is flooded with bookings the puzzle takes longer.
   const [slowCheck, setSlowCheck] = useState(false);
@@ -176,11 +231,10 @@ function BookingWizard({
   const resourceId = preferredId ?? staffId;
   const professional = professionals.find((member) => member.id === resourceId);
   const service = services.find((item) => item.id === serviceId);
-  // A long menu is picked from a dropdown instead of a wall of cards.
-  const manyServices = services.length > 6;
   /** Picks a service; a different one starts the date, time and person over. */
   const chooseService = (id: string) => {
     if (id !== serviceId) {
+      setGift(null);
       setDate(null);
       setTime(null);
       setPreferredId(null);
@@ -188,8 +242,24 @@ function BookingWizard({
     }
     setServiceId(id);
   };
-  // Who can do the chosen service.
-  const team = professionals.filter((member) => serviceId && member.serviceIds.includes(serviceId));
+  /** Picks a location; another one starts the service, date, time and person over. */
+  const chooseLocation = (id: string) => {
+    if (id !== locationId) {
+      setServiceId(null);
+      setDate(null);
+      setTime(null);
+      setPreferredId(null);
+      setStaffId(null);
+    }
+    setLocationId(id);
+  };
+  // Who can do the chosen service, at the chosen location.
+  const team = professionals.filter(
+    (member) =>
+      serviceId &&
+      member.serviceIds.includes(serviceId) &&
+      (!location || location.professionalIds.includes(member.id)),
+  );
 
   // When the step last changed. "Continuar" sits in the same place on every step, so a quick
   // second click would land on the next step's button: submitting an empty form, or booking
@@ -215,12 +285,14 @@ function BookingWizard({
     if (!service || !date || !time || !details) return;
     book.mutate(
       {
+        ...(location ? { locationId: location.id } : {}),
         serviceId: service.id,
         resourceId,
         date,
         time,
         customer: details.customer,
         answers: Object.fromEntries(details.answers.map((answer) => [answer.id, answer.value])),
+        ...(gift ? { giftCode: gift.code } : {}),
         website,
       },
       {
@@ -230,6 +302,8 @@ function BookingWizard({
         },
         onError: (error) => {
           const code = error instanceof ApiError ? error.code : "unknown_error";
+          // The code stopped working meanwhile (its last use went to someone else).
+          if (code === "gift_card_unusable" || code === "gift_card_not_found") setGift(null);
           if (code === "slot_taken") {
             // Someone got there first: back to the times, which reload without that one.
             setTime(null);
@@ -295,10 +369,12 @@ function BookingWizard({
       <div className="mt-6 border-t border-zinc-100">
         <BookingDone
           appointment={booked}
+          showLocation={severalLocations}
           t={t}
           locale={locale}
           onAgain={() => {
             setBooked(null);
+            if (severalLocations) setLocationId(null);
             setServiceId(null);
             setDate(null);
             setTime(null);
@@ -310,12 +386,14 @@ function BookingWizard({
   }
 
   const labels: Record<Step, string> = {
+    location: t("booking.steps.location"),
     service: t("booking.steps.service"),
     datetime: t("booking.steps.datetime"),
     details: t("booking.steps.details"),
     confirm: t("booking.steps.confirm"),
   };
   const titles: Record<Step, string> = {
+    location: t("booking.titles.location"),
     service: t("booking.titles.service"),
     datetime: t("booking.titles.datetime"),
     details: t("booking.titles.details"),
@@ -375,104 +453,67 @@ function BookingWizard({
           </div>
         )}
 
+        {step === "location" && (
+          <ul className="space-y-3">
+            {locations.map((place) => (
+              <li key={place.id}>
+                <button
+                  type="button"
+                  onClick={() => {
+                    chooseLocation(place.id);
+                    next();
+                  }}
+                  className={cn(
+                    "group block w-full rounded-2xl border p-4 text-left transition duration-200 hover:-translate-y-px hover:border-brand-300 hover:shadow-[0_12px_28px_-16px_rgb(15_15_35/0.35)] sm:p-5",
+                    place.id === locationId
+                      ? "border-brand-500 bg-brand-50/40"
+                      : "border-zinc-200 bg-white",
+                  )}
+                >
+                  <div className="flex items-start justify-between gap-4">
+                    <div className="min-w-0">
+                      <div className="font-medium text-zinc-900">{place.name}</div>
+                      {place.address && (
+                        <div className="mt-1.5 flex items-start gap-1.5 text-sm text-zinc-500">
+                          <MapPin className="mt-0.5 size-3.5 shrink-0" aria-hidden />
+                          <span>{place.address}</span>
+                        </div>
+                      )}
+                      {place.phone && (
+                        <div className="mt-1 text-sm text-zinc-500 tabular-nums">{place.phone}</div>
+                      )}
+                    </div>
+                    <ArrowRight
+                      className="mt-0.5 size-4 shrink-0 text-zinc-300 transition group-hover:translate-x-0.5 group-hover:text-brand-600"
+                      aria-hidden
+                    />
+                  </div>
+                </button>
+              </li>
+            ))}
+          </ul>
+        )}
+
         {step === "service" &&
           (services.length === 0 ? (
             <p className="text-sm text-zinc-500">{t("booking.noServices")}</p>
-          ) : manyServices ? (
-            // A long menu is a searchable dropdown; the chosen service shows in full below.
-            <div>
-              <Combobox
-                stacked
-                value={serviceId ?? ""}
-                onChange={chooseService}
-                options={services.map((item) => ({
-                  value: item.id,
-                  label: item.name,
-                  detail: `${formatDuration(item.durationMin)} · ${price(item.priceAmount)}`,
-                  keywords: item.description ?? undefined,
-                }))}
-                placeholder={t("booking.chooseService")}
-                searchPlaceholder={t("booking.searchServices")}
-                emptyText={t("booking.noServiceMatches")}
-              />
-              {service && (
-                <div className="mt-4 rounded-2xl border border-brand-200 bg-brand-50/40 p-4 sm:p-5">
-                  <div className="flex items-start justify-between gap-4">
-                    <div className="min-w-0">
-                      <div className="font-medium text-zinc-900">{service.name}</div>
-                      <div className="mt-1.5 inline-flex items-center gap-1 rounded-full bg-white px-2 py-0.5 text-xs font-medium text-zinc-600">
-                        <Clock className="size-3" aria-hidden />
-                        {formatDuration(service.durationMin)}
-                      </div>
-                    </div>
-                    <span className="shrink-0 font-semibold text-zinc-900 tabular-nums">
-                      {price(service.priceAmount)}
-                    </span>
-                  </div>
-                  {service.description && (
-                    <p className="mt-3 text-sm whitespace-pre-line text-zinc-600">
-                      {service.description}
-                    </p>
-                  )}
-                </div>
-              )}
-              <div className="mt-5 flex justify-end">
-                <Button onClick={next} disabled={!service}>
-                  {t("booking.next")}
-                  <ArrowRight className="size-4" aria-hidden />
-                </Button>
-              </div>
-            </div>
           ) : (
-            <ul className="space-y-3">
-              {services.map((item) => (
-                <li key={item.id}>
-                  <button
-                    type="button"
-                    onClick={() => {
-                      chooseService(item.id);
-                      next();
-                    }}
-                    className={cn(
-                      "group block w-full rounded-2xl border p-4 text-left transition duration-200 hover:-translate-y-px hover:border-brand-300 hover:shadow-[0_12px_28px_-16px_rgb(15_15_35/0.35)] sm:p-5",
-                      item.id === serviceId
-                        ? "border-brand-500 bg-brand-50/40"
-                        : "border-zinc-200 bg-white",
-                    )}
-                  >
-                    <div className="flex items-start justify-between gap-4">
-                      <div className="min-w-0">
-                        <div className="font-medium text-zinc-900">{item.name}</div>
-                        <div className="mt-1.5 inline-flex items-center gap-1 rounded-full bg-zinc-100 px-2 py-0.5 text-xs font-medium text-zinc-600">
-                          <Clock className="size-3" aria-hidden />
-                          {formatDuration(item.durationMin)}
-                        </div>
-                      </div>
-                      <div className="flex shrink-0 items-center gap-3">
-                        <span className="font-semibold text-zinc-900 tabular-nums">
-                          {price(item.priceAmount)}
-                        </span>
-                        <ArrowRight
-                          className="size-4 text-zinc-300 transition group-hover:translate-x-0.5 group-hover:text-brand-600"
-                          aria-hidden
-                        />
-                      </div>
-                    </div>
-                    {item.description && (
-                      <p className="mt-3 text-sm whitespace-pre-line text-zinc-500">
-                        {item.description}
-                      </p>
-                    )}
-                  </button>
-                </li>
-              ))}
-            </ul>
+            <ServiceMenu
+              services={services}
+              selectedId={serviceId}
+              price={price}
+              onChoose={(id) => {
+                chooseService(id);
+                next();
+              }}
+            />
           ))}
 
         {step === "datetime" && service && (
           <DateTimeStep
             slug={slug}
             catalog={catalog}
+            locationId={location?.id ?? null}
             serviceId={service.id}
             team={team}
             preferredId={preferredId}
@@ -537,6 +578,14 @@ function BookingWizard({
         {step === "confirm" && service && date && time && details && (
           <Summary
             rows={[
+              ...(severalLocations && location
+                ? [
+                    {
+                      label: t("booking.location"),
+                      value: [location.name, location.address].filter(Boolean).join(" · "),
+                    },
+                  ]
+                : []),
               { label: t("booking.date"), value: `${formatDay(date, locale)} · ${time}` },
               ...(professional || team.length > 1
                 ? [
@@ -557,11 +606,46 @@ function BookingWizard({
               ...(details.customer.email
                 ? [{ label: t("booking.email"), value: details.customer.email }]
                 : []),
+              ...(details.customer.birthDate
+                ? [
+                    {
+                      label: t("booking.birthDate"),
+                      value: formatBirthDate(details.customer.birthDate, locale),
+                    },
+                  ]
+                : []),
+              ...(details.customer.document
+                ? [{ label: t("booking.document"), value: details.customer.document }]
+                : []),
+              ...(details.customer.gender
+                ? [
+                    {
+                      label: t("booking.gender"),
+                      value: t(`booking.genders.${details.customer.gender}`),
+                    },
+                  ]
+                : []),
               ...details.answers.map((answer) => ({ label: answer.label, value: answer.value })),
+              ...(gift && service.priceAmount !== null
+                ? [
+                    { label: t("booking.price"), value: price(service.priceAmount) },
+                    {
+                      label: t("booking.discountCode", { code: gift.code }),
+                      value: `−${formatPrice(gift.discountAmount, business.currency)}`,
+                    },
+                  ]
+                : []),
             ]}
-            total={price(service.priceAmount)}
+            total={
+              gift && service.priceAmount !== null
+                ? formatPrice(service.priceAmount - gift.discountAmount, business.currency)
+                : price(service.priceAmount)
+            }
             t={t}
           />
+        )}
+        {step === "confirm" && service && (
+          <GiftCodeBox slug={slug} serviceId={service.id} applied={gift} onApply={setGift} t={t} />
         )}
         {step === "confirm" && slowCheck && (
           <p className="mt-4 flex items-center gap-2 text-[13px] text-zinc-500" role="status">
@@ -700,6 +784,67 @@ function DetailsForm({
           )}
         </Field>
       )}
+      {(form.birthDate ?? "hidden") !== "hidden" && (
+        <Field
+          label={t("booking.birthDate")}
+          optional={form.birthDate === "optional"}
+          error={fieldMessage(t, "birthDate", errors["customer.birthDate"])}
+        >
+          {(props) => (
+            <BirthDateField
+              id={props.id}
+              describedBy={props["aria-describedby"]}
+              invalid={props["aria-invalid"]}
+              value={customer.birthDate}
+              onChange={(date) => set("birthDate", date)}
+              locale={locale}
+              labels={{
+                day: t("booking.birthDay"),
+                month: t("booking.birthMonth"),
+                year: t("booking.birthYear"),
+              }}
+            />
+          )}
+        </Field>
+      )}
+      {(form.document ?? "hidden") !== "hidden" && (
+        <Field
+          label={t("booking.document")}
+          optional={form.document === "optional"}
+          error={fieldMessage(t, "document", errors["customer.document"])}
+        >
+          {(props) => (
+            <Input
+              {...props}
+              maxLength={40}
+              value={customer.document}
+              onChange={(event) => set("document", event.target.value)}
+            />
+          )}
+        </Field>
+      )}
+      {(form.gender ?? "hidden") !== "hidden" && (
+        <Field
+          label={t("booking.gender")}
+          optional={form.gender === "optional"}
+          error={fieldMessage(t, "gender", errors["customer.gender"])}
+        >
+          {(props) => (
+            <Select
+              {...props}
+              value={customer.gender}
+              onChange={(event) => set("gender", event.target.value)}
+            >
+              <option value="">{t("booking.genderPlaceholder")}</option>
+              {GENDERS.map((gender) => (
+                <option key={gender} value={gender}>
+                  {t(`booking.genders.${gender}`)}
+                </option>
+              ))}
+            </Select>
+          )}
+        </Field>
+      )}
       {form.questions.map((question) => (
         <QuestionField
           key={question.id}
@@ -794,9 +939,197 @@ function QuestionField({
 
 type TeamMember = PublicCatalog["professionals"][number];
 
+/** Lowercase and without accents, so "depilacion" finds "Depilación". */
+const plain = (text: string) =>
+  text
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase();
+
+/**
+ * The services to choose from as a compact menu, two short lines each, grouped under their
+ * categories (in the order the business put them, the ones without one last), with chips to
+ * show one group and a search once the menu is long.
+ */
+function ServiceMenu({
+  services,
+  selectedId,
+  price,
+  onChoose,
+}: {
+  services: PublicCatalog["services"];
+  selectedId: string | null;
+  price: (amount: number | null) => string;
+  onChoose: (id: string) => void;
+}) {
+  const { t } = useTranslation();
+  const [query, setQuery] = useState("");
+  const [group, setGroup] = useState<string | null>(null);
+  const groups = [...new Set(services.map((item) => item.category ?? ""))].sort(
+    (a, b) => Number(a === "") - Number(b === ""),
+  );
+  const grouped = groups.some((name) => name !== "");
+  const words = plain(query).split(/\s+/).filter(Boolean);
+  const matches = services.filter(
+    (item) =>
+      (group === null || (item.category ?? "") === group) &&
+      words.every((word) =>
+        plain(`${item.name} ${item.description ?? ""} ${item.category ?? ""}`).includes(word),
+      ),
+  );
+  const sections = groups
+    .map((name) => ({ name, items: matches.filter((item) => (item.category ?? "") === name) }))
+    .filter((section) => section.items.length > 0);
+
+  return (
+    <div className="space-y-4">
+      {services.length > 6 && (
+        <div className="relative">
+          <Search
+            className="pointer-events-none absolute top-1/2 left-3 size-4 -translate-y-1/2 text-zinc-400"
+            aria-hidden
+          />
+          <Input
+            type="search"
+            aria-label={t("booking.searchServices")}
+            placeholder={t("booking.searchServices")}
+            value={query}
+            onChange={(event) => setQuery(event.target.value)}
+            className="pl-9"
+          />
+        </div>
+      )}
+      {grouped && groups.length > 1 && (
+        // One line that scrolls sideways on a phone, instead of wrapping into several.
+        <div className="-mx-1 flex gap-2 overflow-x-auto px-1 pb-1 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
+          {[null, ...groups].map((name) => (
+            <button
+              key={name ?? "all"}
+              type="button"
+              aria-pressed={group === name}
+              onClick={() => setGroup(name)}
+              className={cn(
+                "shrink-0 rounded-full border px-3 py-1 text-[13px] font-medium whitespace-nowrap transition-colors",
+                group === name
+                  ? "border-brand-600 bg-brand-600 text-on-brand"
+                  : "border-zinc-200 bg-white text-zinc-700 hover:border-brand-300",
+              )}
+            >
+              {name === null ? t("booking.allServices") : name || t("booking.otherServices")}
+            </button>
+          ))}
+        </div>
+      )}
+      {sections.length === 0 ? (
+        <p className="rounded-xl bg-zinc-50 p-4 text-sm text-zinc-500">
+          {t("booking.noServiceMatches")}
+        </p>
+      ) : (
+        sections.map((section) => (
+          <section key={section.name}>
+            {grouped && (
+              <h3 className="mb-1.5 text-xs font-semibold tracking-wide text-zinc-500 uppercase">
+                {section.name || t("booking.otherServices")}
+              </h3>
+            )}
+            <ul className="divide-y divide-zinc-100 overflow-hidden rounded-2xl border border-zinc-200 bg-white">
+              {section.items.map((item) => (
+                <li key={item.id}>
+                  <button
+                    type="button"
+                    onClick={() => onChoose(item.id)}
+                    className={cn(
+                      "group flex w-full items-center gap-3 px-4 py-3 text-left transition-colors hover:bg-brand-50/50",
+                      item.id === selectedId && "bg-brand-50/60",
+                    )}
+                  >
+                    <div className="min-w-0 flex-1">
+                      <div className="flex items-baseline justify-between gap-3">
+                        <span className="font-medium text-zinc-900">{item.name}</span>
+                        <span className="shrink-0 font-semibold text-zinc-900 tabular-nums">
+                          {price(item.priceAmount)}
+                        </span>
+                      </div>
+                      {/* One line: the whole description shows on hover. */}
+                      <div className="mt-0.5 flex min-w-0 items-center gap-1.5 text-[13px] text-zinc-500">
+                        <Clock className="size-3 shrink-0" aria-hidden />
+                        <span className="shrink-0">{formatDuration(item.durationMin)}</span>
+                        {item.description && (
+                          <>
+                            <span aria-hidden>·</span>
+                            <span className="truncate" title={item.description}>
+                              {item.description}
+                            </span>
+                          </>
+                        )}
+                      </div>
+                    </div>
+                    <ArrowRight
+                      className="size-4 shrink-0 text-zinc-300 transition group-hover:translate-x-0.5 group-hover:text-brand-600"
+                      aria-hidden
+                    />
+                  </button>
+                </li>
+              ))}
+            </ul>
+          </section>
+        ))
+      )}
+    </div>
+  );
+}
+
+/** Who to book with: their photo (or initials) and name, plus "anyone" first. */
+function TeamPicker({
+  label,
+  anyLabel,
+  members,
+  value,
+  onChange,
+}: {
+  label: string;
+  anyLabel: string;
+  members: TeamMember[];
+  value: string | null;
+  onChange: (id: string | null) => void;
+}) {
+  const options = [{ id: null, name: anyLabel, photoUrl: null }, ...members];
+  return (
+    <fieldset>
+      <legend className="mb-2 text-sm font-medium text-zinc-800">{label}</legend>
+      <div className="flex flex-wrap gap-2">
+        {options.map((member) => (
+          <button
+            key={member.id ?? "anyone"}
+            type="button"
+            aria-pressed={value === member.id}
+            onClick={() => onChange(member.id)}
+            className={cn(
+              "flex max-w-full items-center gap-2 rounded-full border py-1 pr-3.5 pl-1 text-sm transition-colors",
+              value === member.id
+                ? "border-brand-500 bg-brand-50 font-medium text-brand-800"
+                : "border-zinc-200 bg-white text-zinc-700 hover:border-brand-300",
+            )}
+          >
+            {member.id === null ? (
+              <span className="grid size-8 shrink-0 place-items-center rounded-full bg-zinc-100 text-zinc-500">
+                <Users className="size-4" aria-hidden />
+              </span>
+            ) : (
+              <Avatar name={member.name} url={member.photoUrl} className="size-8 text-[11px]" />
+            )}
+            <span className="truncate">{member.name}</span>
+          </button>
+        ))}
+      </div>
+    </fieldset>
+  );
+}
+
 function DateTimeStep({
   slug,
   catalog,
+  locationId,
   serviceId,
   team,
   preferredId,
@@ -812,6 +1145,7 @@ function DateTimeStep({
 }: {
   slug: string;
   catalog: PublicCatalog;
+  locationId: string | null;
   serviceId: string;
   /** Professionals who do this service. */
   team: TeamMember[];
@@ -836,6 +1170,7 @@ function DateTimeStep({
   const to = lastOfMonth > lastDate ? lastDate : lastOfMonth;
 
   const availability = useAvailability(slug, {
+    locationId,
     serviceId,
     resourceId: preferredId,
     from,
@@ -859,97 +1194,82 @@ function DateTimeStep({
   const noTimesThisMonth = availability.isSuccess && available.size === 0;
 
   return (
-    <div className="grid gap-8 md:grid-cols-[minmax(0,1fr)_minmax(0,1fr)]">
-      <div className="space-y-5">
-        {team.length > 1 && (
-          <Field label={t("booking.preferredLabel")}>
-            {(props) => (
-              <Select
-                {...props}
-                value={preferredId ?? ""}
-                onChange={(event) => onPreferred(event.target.value || null)}
-              >
-                <option value="">{t("booking.anyProfessional")}</option>
-                {team.map((member) => (
-                  <option key={member.id} value={member.id}>
-                    {member.name}
-                  </option>
-                ))}
-              </Select>
-            )}
-          </Field>
-        )}
-        <MonthCalendar
-          month={month}
-          onMonthChange={setMonth}
-          minMonth={today.slice(0, 7)}
-          maxMonth={lastDate.slice(0, 7)}
-          available={available}
-          selected={date}
-          onSelect={onDate}
-          loading={availability.isFetching}
-          locale={locale}
-          labels={{ previous: t("booking.previousMonth"), next: t("booking.nextMonth") }}
+    <div className="space-y-6">
+      {/* Who first, across the whole width; then the day and its times side by side. */}
+      {team.length > 1 && (
+        <TeamPicker
+          label={t("booking.preferredLabel")}
+          anyLabel={t("booking.anyProfessional")}
+          members={team}
+          value={preferredId}
+          onChange={onPreferred}
         />
-      </div>
-      <div>
-        {noTimesThisMonth ? (
-          <p className="rounded-xl bg-zinc-50 p-4 text-sm text-zinc-500">
-            {t("booking.noTimesMonth")}
-          </p>
-        ) : date ? (
-          <>
-            <p className="mb-3 text-sm font-medium text-zinc-900 first-letter:uppercase">
-              {formatDay(date, locale)}
+      )}
+      <div className="grid gap-8 md:grid-cols-[minmax(0,1fr)_minmax(0,1fr)]">
+        <div>
+          <MonthCalendar
+            month={month}
+            onMonthChange={setMonth}
+            minMonth={today.slice(0, 7)}
+            maxMonth={lastDate.slice(0, 7)}
+            available={available}
+            selected={date}
+            onSelect={onDate}
+            loading={availability.isFetching}
+            locale={locale}
+            labels={{ previous: t("booking.previousMonth"), next: t("booking.nextMonth") }}
+          />
+        </div>
+        <div>
+          {noTimesThisMonth ? (
+            <p className="rounded-xl bg-zinc-50 p-4 text-sm text-zinc-500">
+              {t("booking.noTimesMonth")}
             </p>
-            <div className="grid grid-cols-3 gap-2 sm:grid-cols-4 md:grid-cols-3">
-              {times.map((slot) => (
-                <button
-                  key={slot}
-                  type="button"
-                  onClick={() => onTime(slot)}
-                  aria-pressed={slot === time}
-                  className={cn(
-                    "h-10 rounded-xl border text-sm font-medium tabular-nums transition-colors",
-                    slot === time
-                      ? "border-brand-600 bg-brand-600 text-on-brand"
-                      : "border-zinc-200 bg-white text-zinc-800 hover:border-brand-300 hover:bg-brand-50/40",
-                  )}
-                >
-                  {slot}
-                </button>
-              ))}
-            </div>
-            {/* With "anyone", say who is free at that time and let them choose. */}
-            {time && preferredId === null && free.length > 1 && (
-              <div className="mt-5 rounded-2xl bg-zinc-50 p-4">
-                <Field label={t("booking.whoAtTime", { time })}>
-                  {(props) => (
-                    <Select
-                      {...props}
-                      value={staffId ?? ""}
-                      onChange={(event) => onStaff(event.target.value || null)}
-                    >
-                      <option value="">{t("booking.anyone")}</option>
-                      {free.map((member) => (
-                        <option key={member.id} value={member.id}>
-                          {member.name}
-                        </option>
-                      ))}
-                    </Select>
-                  )}
-                </Field>
-              </div>
-            )}
-            {time && preferredId === null && free.length === 1 && (
-              <p className="mt-5 rounded-2xl bg-zinc-50 p-4 text-sm text-zinc-600">
-                {t("booking.onlyOneFree", { name: free[0]?.name })}
+          ) : date ? (
+            <>
+              <p className="mb-3 text-sm font-medium text-zinc-900 first-letter:uppercase">
+                {formatDay(date, locale)}
               </p>
-            )}
-          </>
-        ) : (
-          availability.isPending && <Spinner />
-        )}
+              <div className="grid grid-cols-3 gap-2 sm:grid-cols-4 md:grid-cols-3">
+                {times.map((slot) => (
+                  <button
+                    key={slot}
+                    type="button"
+                    onClick={() => onTime(slot)}
+                    aria-pressed={slot === time}
+                    className={cn(
+                      "h-10 rounded-xl border text-sm font-medium tabular-nums transition-colors",
+                      slot === time
+                        ? "border-brand-600 bg-brand-600 text-on-brand"
+                        : "border-zinc-200 bg-white text-zinc-800 hover:border-brand-300 hover:bg-brand-50/40",
+                    )}
+                  >
+                    {slot}
+                  </button>
+                ))}
+              </div>
+              {/* With "anyone", say who is free at that time and let them choose. */}
+              {time && preferredId === null && free.length > 1 && (
+                <div className="mt-5 rounded-2xl bg-zinc-50 p-4">
+                  <TeamPicker
+                    label={t("booking.whoAtTime", { time })}
+                    anyLabel={t("booking.anyone")}
+                    members={free}
+                    value={staffId}
+                    onChange={onStaff}
+                  />
+                </div>
+              )}
+              {time && preferredId === null && free.length === 1 && (
+                <p className="mt-5 rounded-2xl bg-zinc-50 p-4 text-sm text-zinc-600">
+                  {t("booking.onlyOneFree", { name: free[0]?.name })}
+                </p>
+              )}
+            </>
+          ) : (
+            availability.isPending && <Spinner />
+          )}
+        </div>
       </div>
     </div>
   );
@@ -989,11 +1309,13 @@ function Summary({
 
 function BookingDone({
   appointment,
+  showLocation,
   t,
   locale,
   onAgain,
 }: {
   appointment: BookedAppointment;
+  showLocation: boolean;
   t: T;
   locale: string;
   onAgain: () => void;
@@ -1014,6 +1336,16 @@ function BookingDone({
       <div className="mt-7 w-full max-w-md text-left">
         <Summary
           rows={[
+            ...(showLocation
+              ? [
+                  {
+                    label: t("booking.location"),
+                    value: [appointment.location.name, appointment.location.address]
+                      .filter(Boolean)
+                      .join(" · "),
+                  },
+                ]
+              : []),
             {
               label: t("booking.date"),
               value: `${formatDay(appointment.date, locale)} · ${appointment.time}`,
@@ -1022,11 +1354,22 @@ function BookingDone({
               ? [{ label: t("booking.professional"), value: appointment.resourceName }]
               : []),
             { label: t("booking.service"), value: appointment.serviceName },
+            ...(appointment.discountAmount > 0
+              ? [
+                  {
+                    label: t("booking.discount"),
+                    value: `−${formatPrice(appointment.discountAmount, appointment.currency)}`,
+                  },
+                ]
+              : []),
           ]}
           total={
             appointment.priceAmount === null
               ? t("services.priceOnRequest")
-              : formatPrice(appointment.priceAmount, appointment.currency)
+              : formatPrice(
+                  appointment.priceAmount - appointment.discountAmount,
+                  appointment.currency,
+                )
           }
           t={t}
         />
@@ -1037,6 +1380,94 @@ function BookingDone({
           {t("booking.bookAgain")}
         </Button>
       </div>
+    </div>
+  );
+}
+
+/** "¿Tienes un código de descuento?": checked against the chosen service before booking. */
+function GiftCodeBox({
+  slug,
+  serviceId,
+  applied,
+  onApply,
+  t,
+}: {
+  slug: string;
+  serviceId: string;
+  applied: { code: string; discountAmount: number } | null;
+  onApply: (gift: { code: string; discountAmount: number } | null) => void;
+  t: T;
+}) {
+  const [open, setOpen] = useState(false);
+  const [code, setCode] = useState("");
+  const check = useGiftCodeCheck(slug);
+
+  if (applied) {
+    return (
+      <p className="mt-4 flex items-center justify-between gap-3 rounded-xl bg-brand-50/60 px-4 py-3 text-sm">
+        <span className="text-zinc-700">{t("booking.codeApplied", { code: applied.code })}</span>
+        <button
+          type="button"
+          className="font-medium text-brand-700 hover:underline"
+          onClick={() => onApply(null)}
+        >
+          {t("booking.removeCode")}
+        </button>
+      </p>
+    );
+  }
+  if (!open) {
+    return (
+      <button
+        type="button"
+        className="mt-4 text-sm font-medium text-brand-700 hover:underline"
+        onClick={() => setOpen(true)}
+      >
+        {t("booking.haveCode")}
+      </button>
+    );
+  }
+  const apply = () => {
+    if (!code.trim()) return;
+    check.mutate(
+      { code, serviceId },
+      {
+        onSuccess: (result) =>
+          onApply({ code: result.code, discountAmount: result.discountAmount }),
+      },
+    );
+  };
+  const problem =
+    check.error instanceof ApiError
+      ? check.error.code === "gift_card_unusable"
+        ? t(
+            `booking.codeStates.${check.error.fields.code ?? "inactive"}` as "booking.codeStates.inactive",
+          )
+        : check.error.code === "gift_card_not_found"
+          ? t("booking.codeNotFound")
+          : t("errors.unknown_error")
+      : null;
+  return (
+    <div className="mt-4 space-y-2">
+      <div className="flex gap-2">
+        <Input
+          aria-label={t("booking.codePlaceholder")}
+          placeholder={t("booking.codePlaceholder")}
+          className="font-mono uppercase"
+          value={code}
+          onChange={(event) => setCode(event.target.value.toUpperCase())}
+          onKeyDown={(event) => {
+            if (event.key === "Enter") {
+              event.preventDefault();
+              apply();
+            }
+          }}
+        />
+        <Button variant="secondary" onClick={apply} loading={check.isPending}>
+          {t("booking.applyCode")}
+        </Button>
+      </div>
+      {problem && <p className="text-[13px] text-red-600">{problem}</p>}
     </div>
   );
 }

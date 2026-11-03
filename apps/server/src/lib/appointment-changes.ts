@@ -32,7 +32,7 @@ export async function moveAppointment(
   business: Business,
   current: Appointment,
   service: Service,
-  input: { resourceId: string | null; date: string; time: string },
+  input: { locationId: string; resourceId: string | null; date: string; time: string },
   rules: BookingRules,
 ): Promise<Appointment> {
   return db.transaction(async (tx) => {
@@ -40,6 +40,7 @@ export async function moveAppointment(
     const schedules = await loadSchedules(
       tx,
       business,
+      input.locationId,
       service.id,
       input.resourceId,
       input.date,
@@ -61,6 +62,7 @@ export async function moveAppointment(
     const [updated] = await tx
       .update(appointments)
       .set({
+        locationId: input.locationId,
         serviceId: service.id,
         serviceName: service.name,
         // The price agreed at booking stays unless the service itself changes.
@@ -109,13 +111,21 @@ export async function findCustomerAppointment(
   return row;
 }
 
+/** Why an appointment that isn't confirmed any more can't be changed, charged or cancelled. */
+export function closedError(appointment: Pick<Appointment, "status">) {
+  return apiError(
+    409,
+    appointment.status === "no_show" ? "appointment_no_show" : "appointment_cancelled",
+  );
+}
+
 /** Whether the customer may still move or cancel this appointment themselves. */
 export function assertCustomerCanChange(
   business: Business,
   appointment: Appointment,
   now = Date.now(),
 ) {
-  if (appointment.status !== "confirmed") throw apiError(409, "appointment_cancelled");
+  if (appointment.status !== "confirmed") throw closedError(appointment);
   if (business.customerChangeNoticeMin === null) throw apiError(403, "changes_not_allowed");
   const deadline = appointment.startsAt.getTime() - business.customerChangeNoticeMin * 60_000;
   if (now > deadline) throw apiError(409, "too_late_to_change");

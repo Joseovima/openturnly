@@ -2,6 +2,7 @@ import { formatPrice, fromMinorUnits, serviceSchema, toMinorUnits } from "@opent
 import { Pencil, Plus, Scissors } from "lucide-react";
 import { type FormEvent, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { Checklist } from "../../components/checklist.tsx";
 import { useConfirm } from "../../components/confirm.tsx";
 import { EmptyState, Modal, PageHeader, Switch } from "../../components/controls.tsx";
 import { type Column, DataTable } from "../../components/data-table.tsx";
@@ -17,7 +18,7 @@ import {
   Textarea,
 } from "../../components/ui.tsx";
 import type { Service } from "../../lib/api.ts";
-import { useServiceMutations, useServices } from "../../lib/catalog.ts";
+import { useLocations, useServiceMutations, useServices } from "../../lib/catalog.ts";
 import { currencySymbol, formatDuration } from "../../lib/format.ts";
 import { errorMessage, type FieldErrors, fieldMessage, validate } from "../../lib/forms.ts";
 import { useBusinessContext } from "./business.tsx";
@@ -42,8 +43,14 @@ export function ServicesPage() {
       cell: (service) => (
         <div className="min-w-0 max-w-md">
           <div className="truncate font-medium text-zinc-900">{service.name}</div>
-          {service.description && (
-            <div className="truncate text-[13px] text-zinc-500">{service.description}</div>
+          {(service.category || service.description) && (
+            <div className="truncate text-[13px] text-zinc-500">
+              {service.category && (
+                <span className="font-medium text-zinc-600">{service.category}</span>
+              )}
+              {service.category && service.description && " · "}
+              {service.description}
+            </div>
           )}
         </div>
       ),
@@ -138,8 +145,22 @@ function ServiceForm({ service, onClose }: { service: Service | null; onClose: (
   const { t, i18n } = useTranslation();
   const { business } = useBusinessContext();
   const { save, remove } = useServiceMutations(business.id);
+  const locations = useLocations(business.id).data ?? [];
+  // The groups already in use, suggested so the same one is written the same way.
+  const categories = [
+    ...new Set(
+      (useServices(business.id).data ?? []).flatMap((item) =>
+        item.category ? [item.category] : [],
+      ),
+    ),
+  ].sort((a, b) => a.localeCompare(b, i18n.language));
   const confirm = useConfirm();
   const [name, setName] = useState(service?.name ?? "");
+  const [category, setCategory] = useState(service?.category ?? "");
+  // New services are offered everywhere to begin with.
+  const [locationIds, setLocationIds] = useState<string[]>(
+    service?.locationIds ?? locations.map((location) => location.id),
+  );
   const [description, setDescription] = useState(service?.description ?? "");
   const [durationMin, setDurationMin] = useState(service?.durationMin ?? 30);
   const [price, setPrice] = useState(
@@ -155,6 +176,7 @@ function ServiceForm({ service, onClose }: { service: Service | null; onClose: (
     const amount = Number(price.replace(",", "."));
     const values = {
       name,
+      category,
       description,
       durationMin,
       // Empty or unreadable fails validation: every service shows its price.
@@ -163,6 +185,7 @@ function ServiceForm({ service, onClose }: { service: Service | null; onClose: (
           ? undefined
           : toMinorUnits(amount, business.currency),
       active,
+      ...(locations.length > 1 ? { locationIds } : {}),
     };
     const result = validate(serviceSchema, values);
     setErrors(result.errors ?? {});
@@ -237,6 +260,24 @@ function ServiceForm({ service, onClose }: { service: Service | null; onClose: (
             />
           )}
         </Field>
+        <Field label={t("services.category")} optional hint={t("services.categoryHint")}>
+          {(props) => (
+            <>
+              <Input
+                {...props}
+                list="service-categories"
+                placeholder={t("services.categoryPlaceholder")}
+                value={category}
+                onChange={(event) => setCategory(event.target.value)}
+              />
+              <datalist id="service-categories">
+                {categories.map((item) => (
+                  <option key={item} value={item} />
+                ))}
+              </datalist>
+            </>
+          )}
+        </Field>
         <div className="grid grid-cols-2 gap-4">
           <Field label={t("fields.duration")}>
             {(props) => (
@@ -289,6 +330,19 @@ function ServiceForm({ service, onClose }: { service: Service | null; onClose: (
             />
           )}
         </Field>
+        {locations.length > 1 && (
+          <fieldset className="space-y-2">
+            <legend className="text-sm font-medium text-zinc-800">
+              {t("services.locationsLabel")}
+            </legend>
+            <Checklist
+              label={t("services.locationsLabel")}
+              value={locationIds}
+              onChange={setLocationIds}
+              items={locations.map((location) => ({ id: location.id, label: location.name }))}
+            />
+          </fieldset>
+        )}
         <div className="border-t border-zinc-100 pt-4">
           <Switch
             checked={active}
