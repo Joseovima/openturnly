@@ -31,6 +31,22 @@ const DEFAULT_DATA_DIR = fileURLToPath(new URL("../../../data", import.meta.url)
 const WEB_DIST_DIR = fileURLToPath(new URL("../../web/dist", import.meta.url));
 const VITE_DEV_ORIGIN = "http://localhost:5173";
 
+function getTrustedOrigins(appUrl: string, isProduction: boolean): string[] {
+  const origins = new Set<string>();
+  origins.add(appUrl);
+  try {
+    const parsed = new URL(appUrl);
+    const portPart = parsed.port ? `:${parsed.port}` : "";
+    if (parsed.hostname.startsWith("www.")) {
+      origins.add(`${parsed.protocol}//${parsed.hostname.slice(4)}${portPart}`);
+    } else {
+      origins.add(`${parsed.protocol}//www.${parsed.hostname}${portPart}`);
+    }
+  } catch {}
+  if (!isProduction) origins.add(VITE_DEV_ORIGIN);
+  return Array.from(origins);
+}
+
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   const isProduction = env.NODE_ENV === "production";
   const port = Number(env.PORT ?? 3000);
@@ -52,7 +68,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     databaseUrl,
     secret: env.SECRET || readOrCreateSecret(dataDir),
     webDistDir: WEB_DIST_DIR,
-    trustedOrigins: isProduction ? [appUrl] : [appUrl, VITE_DEV_ORIGIN],
+    trustedOrigins: getTrustedOrigins(appUrl, isProduction),
     trustProxy: env.TRUST_PROXY === "true",
     bookingGuard: DEFAULT_GUARD_SETTINGS,
     allowPrivateWebhooks: env.WEBHOOKS_ALLOW_PRIVATE
